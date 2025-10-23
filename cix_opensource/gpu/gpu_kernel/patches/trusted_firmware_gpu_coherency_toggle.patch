@@ -1,0 +1,117 @@
+commit 5f0a5507eb6c9ed3745b89a1246bb7a7b6141857
+Author: Petter Lundanes <petter.lundanes@arm.com>
+Date:   Mon Feb 9 14:37:06 2015 +0100
+
+    Adds a service to enable/disable GPU cache snooping
+    
+    Adds a service to enable/disable cache snooping over
+    CCI for GPU on request from SMC (mali kernel driver).
+
+diff --git a/bl31/bl31.mk b/bl31/bl31.mk
+index 4c25a60..cd0b530 100644
+--- a/bl31/bl31.mk
++++ b/bl31/bl31.mk
+@@ -50,7 +50,8 @@ BL31_SOURCES		+=	bl31/bl31_main.c				\
+ 				services/std_svc/psci/psci_helpers.S		\
+ 				services/std_svc/psci/psci_main.c		\
+ 				services/std_svc/psci/psci_setup.c		\
+-				services/std_svc/psci/psci_system_off.c
++				services/std_svc/psci/psci_system_off.c \
++				services/sips/arm/css/svc.c
+ 
+ ifeq (${USE_COHERENT_MEM}, 1)
+ BL31_SOURCES		+=	lib/locks/bakery/bakery_lock_coherent.c
+diff --git a/services/sips/arm/css/svc.c b/services/sips/arm/css/svc.c
+new file mode 100644
+index 0000000..bbc63a4
+--- /dev/null
++++ b/services/sips/arm/css/svc.c
+@@ -0,0 +1,88 @@
++#include <debug.h>
++#include <runtime_svc.h>
++#include <stdint.h>
++#include <cci400.h>
++#include <uuid.h>
++#include <mmio.h>
++
++
++/* This should be updated to the CCI port the GPU is connect to on your platform.*/
++#define GPU_CCI_PORT 3U
++
++/*
++ * See SMC calling convention for details.
++ * Bit 31 - 1 = Fast call.
++ * Bits 29:24 - 0x2 = SIP service call.
++ * Bits 15:00 - Function number.
++ *
++ * These must correspond to the IDs given in device tree for the device driver.
++ */
++#define SMC_FID_ENABLE_COHERENCY (0x8200ff04)
++#define SMC_FID_DISABLE_COHERENCY (0x8200ff05)
++
++/* Setup CSS Services */
++static int32_t css_svc_setup(void)
++{
++	return 0;
++}
++
++static void cci_enable_gpu_coherency(unsigned int cciport)
++{
++	/* Enable Snoops */
++	mmio_write_32(CCI400_BASE + SLAVE_IFACE_OFFSET(cciport) + SNOOP_CTRL_REG,
++		      (SNOOP_EN_BIT));
++
++	/* Wait for the dust to settle down */
++	while (mmio_read_32(CCI400_BASE + STATUS_REG) & CHANGE_PENDING_BIT)
++		;
++}
++static void cci_disable_gpu_coherency(unsigned int cciport)
++{
++	/* Disable Snoops */
++	mmio_write_32(CCI400_BASE + SLAVE_IFACE_OFFSET(cciport) + SNOOP_CTRL_REG,
++		      0U);
++
++	/* Wait for the dust to settle down */
++	while (mmio_read_32(CCI400_BASE + STATUS_REG) & CHANGE_PENDING_BIT)
++		;
++}
++
++/*
++ * Top-level CSS Service SMC handler.
++ */
++uint64_t css_svc_smc_handler(uint32_t smc_fid,
++			     uint64_t x1,
++			     uint64_t x2,
++			     uint64_t x3,
++			     uint64_t x4,
++			     void *cookie,
++			     void *handle,
++			     uint64_t flags)
++{
++	switch (smc_fid) {
++	case SMC_FID_ENABLE_COHERENCY:
++	{
++		cci_enable_gpu_coherency(GPU_CCI_PORT);
++		SMC_RET1(handle, 0x0);
++	}
++	case SMC_FID_DISABLE_COHERENCY:
++	{
++		cci_disable_gpu_coherency(GPU_CCI_PORT);
++		SMC_RET1(handle, 0x0);
++	}
++	default:
++		WARN("Unimplemented CSS Service Call: 0x%x \n", smc_fid);
++		SMC_RET1(handle, SMC_UNK);
++	}
++}
++
++/* Register as runtime service */
++DECLARE_RT_SVC(
++		css_svc,
++
++		OEN_SIP_START,
++		OEN_SIP_END,
++		SMC_TYPE_FAST,
++		css_svc_setup,
++		css_svc_smc_handler
++);

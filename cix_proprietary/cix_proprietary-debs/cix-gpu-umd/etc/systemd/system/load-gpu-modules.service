@@ -1,0 +1,10 @@
+[Unit]
+Description=Load gpu modules
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/load-gpu-modules.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

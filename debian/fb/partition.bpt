@@ -1,0 +1,36 @@
+{
+    "settings": {
+        "platform": "linux",
+        "disk_size": "261 MiB",
+        "disk_alignment": 1048576,
+        "partitions_offset_begin": 10485760
+    },
+    "partitions": [
+        {
+            "label": "boot",
+            "size": "200 MiB",
+            "guid": "auto",
+            "type_guid": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+            "name": "boot_sparse.img"
+        },
+        {
+            "label": "root",
+            "grow": true,
+            "guid": "auto",
+            "type_guid": "B921B045-1DF0-41C3-AF44-4C6F280D3FAE",
+            "name": "rootfs_sparse.ext4"
+        }
+    ],
+    "commands": [
+        "devices",
+        "getvar all"
+    ],
+    "flash_nor": {
+        "label": "bootloader",
+        "name": "cix_flash_all.bin"
+    },
+    "gpt": {
+        "label": "gpt",
+        "name": "partition-table.img"
+    }
+}

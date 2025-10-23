@@ -1,0 +1,67 @@
+import os
+import platform
+import subprocess
+
+###############################################################################
+# Create environment.
+###############################################################################
+
+env = Environment(tools = ['default', 'misc'], ENV = os.environ)
+
+###############################################################################
+# Set up variables.
+###############################################################################
+
+# Read variables from cache.
+vars = Variables('.scons.vars')
+
+# Read in variables from env and save them in the cache.
+vars.Update(env)
+vars.Save('.scons.vars', env)
+
+# Set the default help message.
+env.Help(vars.GenerateHelpText(env))
+
+###############################################################################
+# Configure environment.
+###############################################################################
+
+# Set cross compile prefix.
+env.Replace(OBJCOPY = 'objcopy')
+if 'CROSS_COMPILE' in os.environ:
+    env.Replace(CC = os.environ['CROSS_COMPILE'].strip() + env['CC'])
+    env.Replace(CXX = os.environ['CROSS_COMPILE'].strip() + env['CXX'])
+    env.Replace(AR = os.environ['CROSS_COMPILE'].strip() + env['AR'])
+    env.Replace(OBJCOPY = os.environ['CROSS_COMPILE'].strip() + env['OBJCOPY'])
+
+# Define paths to be used for building and installing files.
+# Both GCC and Clang support -dumpmachine.
+arch = subprocess.check_output([env['CC'], '-dumpmachine']).strip()
+arch = arch.decode('utf-8')
+env.Replace(BUILD_DIR_PATH = env.Dir('build').abspath)
+env.Replace(BIN_DIR = os.path.join('#', 'bin', arch))
+env.Replace(INCLUDE_DIR = os.path.join('#', 'include', arch))
+env.Replace(LIB_DIR = os.path.join('#', 'lib', arch))
+
+# Setup default path to Linux kernel headers.
+if not 'KDIR' in os.environ:
+    env.Replace(KDIR = '/usr/src/linux-headers-' + platform.uname()[2])
+else:
+    env.Replace(KDIR = os.environ['KDIR'])
+    env.Append(CXXFLAGS = ['-isystem', os.path.join(os.environ['KDIR'], 'usr', 'include')])
+
+# Default build flags.
+env.Append(CPPFLAGS = ['-Wall'])
+env.Append(CPPPATH = [env['INCLUDE_DIR']])
+env.Append(LIBPATH = [env['LIB_DIR']])
+env.Append(RPATH = [env.Literal(os.path.join('\\$$ORIGIN', os.path.relpath(env['LIB_DIR'], env['BIN_DIR'])))])
+
+#
+# Export environment and build recursive.
+#
+if 'SYSROOT' in os.environ:
+    env.Replace(CC = env['CC'] + ' --sysroot=' + os.environ['SYSROOT'])
+    env.Replace(CXX = env['CXX'] + ' --sysroot=' + os.environ['SYSROOT'])
+
+Export('env')
+env.BuildRecursive()

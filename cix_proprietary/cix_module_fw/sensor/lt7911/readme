@@ -1,0 +1,21 @@
+
+1,LT7911UX_U3_DP_TO_MIPI_CSI_YUV422_640×480_1P1L_Cixtech_20240126.hex is 1 lane 400M
+output dp_in realtime picture
+
+2,LT7911UXC_U3_DP_TO_MIPI_CSI_NioTest_1080P60_Ctrl.hex:
+	4 lane 673.98M yuv422 1920x1080 60fps dp_in realtime output picture
+
+3,LT7911UXC_U3_DP_TO_MIPI_CSI_NioTest_4K60_Ctrl.hex:
+	4 lane 2455.92M yuv422 3840x2160 60fps dp_in realtime output picture
+
+4,LT7911UXC_U3_DP_TO_MIPI_CSI_NioTest_4K60_Ctrl_V24060301.hex
+	fix LT7911UXC_U3_DP_TO_MIPI_CSI_NioTest_4K60_Ctrl.hex left/right picture reverse
+
+5,LT7911UXC_U3_TYPEC_TO_MIPI_CSI_MP8859_NioTest_20240625.hex
+	this for niobox type-c to type-c interface firmware
+
+6,LT7911UXC_U3_TYPEC_TO_MIPI_CSI_MP8859_NioTest_20240719.hex
+	this for niobox base the MP8859_NioTest_20240625.hex and add audio 8 channel function
+
+7,LT7911UXC_U3_DP_TO_MIPI_CSI_NioTest_4K60_Ctrl_V24080801.hex
+	this for evb  audio 8 channel function

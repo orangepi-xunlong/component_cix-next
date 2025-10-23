@@ -1,0 +1,22 @@
+#set log level
+log:levelMask=0x3333333333,ispMask=0xffffffffffffffff,sw3aMask=0x7
+
+#set test case
+set:camid=0,pWidth=4224,pHeight=3136,vWidth=4224,vHeight=3136,vFmt=NV12,fps=30
+set:camid=1,pWidth=4224,pHeight=3136,vWidth=4224,vHeight=3136,vFmt=NV12,fps=30
+
+#start running
+start
+
+#dump 5frames per camera
+dump:camid=0,num=5,period=5
+dump:camid=1,num=5,period=5
+
+#continue 60s
+sleep:time=60
+
+#stop running
+stop
+
+#exit running
+exit

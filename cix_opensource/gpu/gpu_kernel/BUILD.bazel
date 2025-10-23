@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+#
+# (C) COPYRIGHT 2023 ARM Limited. All rights reserved.
+#
+# This program is free software and is provided to you under the terms of the
+# GNU General Public License version 2 as published by the Free Software
+# Foundation, and any use by you of this program is subject to the terms
+# of such GNU license.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, you can access it online at
+# http://www.gnu.org/licenses/gpl-2.0.html.
+#
+#
+
+load(
+    "//build/kernel/kleaf:kernel.bzl",
+    "kernel_module_group",
+)
+
+filegroup(
+    name = "headers",
+    srcs = glob([
+        "include/**/*.h",
+    ]),
+    visibility = [
+        "//common:__pkg__",
+        "//common-modules/mali:__subpackages__",
+    ],
+)
+
+filegroup(
+    name = "kconfigs",
+    srcs = [
+        "//common-modules/mali/drivers/base/arm:base_kconfig",
+        "//common-modules/mali/drivers/gpu/arm:gpu_kconfig",
+        "//common-modules/mali/drivers/hwtracing/coresight/mali:hwtracing_coresight_kconfig",
+        "//common-modules/mali/drivers/xen/arm:xen_kconfig",
+    ],
+    visibility = [
+        "//common:__pkg__",
+        "//common-modules/mali:__subpackages__",
+    ],
+)
+
+kernel_module_group(
+    name = "modules",
+    srcs = [
+        "//common-modules/mali/drivers/base/arm:base",
+        "//common-modules/mali/drivers/gpu/arm:gpu",
+        "//common-modules/mali/drivers/hwtracing/coresight/mali:hwtracing_coresight",
+        "//common-modules/mali/drivers/xen/arm:xen",
+    ],
+    visibility = [
+        "//common:__pkg__",
+        "//common-modules/mali:__subpackages__",
+    ],
+)

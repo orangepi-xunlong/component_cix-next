@@ -1,0 +1,16 @@
+*.cmd
+*.o
+*.o.d
+bin
+build
+.scons.vars
+.sconsign.dblite
+*/amvx*
+*/Module.symvers
+*/modules.order
+include
+lib
+site_scons/site_tools/__pycache__
+nohup.out
+.vscode/
+.scons*

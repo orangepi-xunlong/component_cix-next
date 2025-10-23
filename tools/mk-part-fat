@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+
+# Copyright (c) 2021 Arm Limited. All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+print_usage() {
+    cat <<EOF
+Usage:
+    $0 -o OUTPUT -s SIZE [-l VOLUME-NAME] [SOURCE-FILE TARGET-FILE]...
+    $0 -h
+Create partition image file OUTPUT formatted as vfat.
+
+    -o OUTPUT
+       OUTPUT will be created if it doesn't already exist.
+       If it already exists it must be a regular file (not a block device) and
+       the content will be discarded.
+    -s SIZE
+       Set the size of the created file OUTPUT to SIZE bytes.
+       Special value "AUTO" will make the partition image as small as possible
+       (with-in reason).
+       The final size of the AUTO sized file-system will be rounded up to the
+       nearest 1K.
+    -l VOLUME-NAME
+       Sets the volume name (label) of the filesystem.
+       The VOLUME-NAME can be up to 11 characters long. The default is no label.
+
+The SIZE argument can be given an optional unit (example: 10K is 10*1024).
+Units are K,M,G,T,P,E,Z,Y (powers of 1024) or KB,MB,... (powers of 1000).
+
+Each SOURCE-FILE TARGET-FILE pair describe one file read from SOURCE_FILE and
+written to OUTPUT as TARGET-FILE.
+Directories in TARGET-FILE are created as needed.
+EOF
+}
+
+# estimated overhead (in bytes) for each file when SIZE==AUTO
+readonly CFG_FAT_OVERHEAD="$((1024*128))"
+
+# minimum size when using SIZE==AUTO
+readonly CFG_MIN_AUTO="$((1024*64))"
+
+for_each_file_mapping() {
+    local parser="$1" ; shift
+    set -- "${PARG_FILE_MAPPINGS[@]}"
+    while [[ "$#" -ne 0 ]] ; do
+        SRC="$(realpath "$1")" ; shift
+        DST="${1^^}" ; shift
+        "$parser" "$DST" "$SRC"
+    done
+}
+
+add_to_output() {
+    local DST="$1" ; shift
+    local SRC="$1" ; shift
+    local FULL_DIR_PATH=""
+
+    while true ; do
+        D="${DST%%/*}"
+        NEW_DST="${DST#*/}"
+        [[ "$NEW_DST" = "$DST" ]] && break
+        DST="$NEW_DST"
+        [[ "$D" = "" ]] && continue
+        [[ -t 1 ]] && printf "."
+
+        FULL_DIR_PATH+="/$D"
+        # it exists?
+        if mdir -i "$PARG_OUTPUT" -b "::$FULL_DIR_PATH" &>/dev/null ; then
+            # if it is a directory then it is fine
+            mdir -i "$PARG_OUTPUT" -b "::$FULL_DIR_PATH/" &>/dev/null && continue
+
+            # but a file is a critical error
+            echo "$FULL_DIR_PATH exists but is not a directory!" >&2
+            exit 1
+        fi
+
+        mmd -i "$PARG_OUTPUT" "::$FULL_DIR_PATH"
+    done
+    mcopy -i "$PARG_OUTPUT" -D overwrite "$SRC" "::$FULL_DIR_PATH/$DST"
+}
+
+enumerate_input_files() {
+    local DST="$1" ; shift
+    local SRC="$1" ; shift
+    echo "$SRC"
+}
+
+get_img_free_size() {
+    local IMG="$1" ; shift
+    LC_ALL=C mdir -i "$IMG" ::. | tr -d ' ' | sed -nre 's#bytesfree$##p'
+}
+
+set -e
+set -u
+exec </dev/null
+
+# see mtools(5)
+export MTOOLS_SKIP_CHECK=1
+
+declare PARG_OUTPUT=""
+declare PARG_SIZE=""
+declare PARG_VOLUME_NAME=""
+declare -a PARG_FILE_MAPPINGS
+while getopts "ho:s:l:" opt; do
+    case $opt in
+    ("o") PARG_OUTPUT="$OPTARG" ;;
+    ("s") PARG_SIZE="$OPTARG" ;;
+    ("l") PARG_VOLUME_NAME="$OPTARG" ;;
+    ("h")
+        print_usage
+        exit 0
+        ;;
+    ("?")
+        print_usage >&2
+        exit 1
+    esac
+done
+shift $((OPTIND-1))
+
+if [[ -z "$PARG_OUTPUT" ]] ; then
+    echo "Mandatory -o not given!" >&2
+    echo "" >&2
+    print_usage >&2
+    exit 1
+fi
+readonly PARG_OUTPUT
+
+if [[ -z "$PARG_SIZE" ]] ; then
+    echo "Mandatory -s not given!" >&2
+    echo "" >&2
+    print_usage >&2
+    exit 1
+fi
+readonly PARG_SIZE
+
+readonly PARG_VOLUME_NAME
+readonly PARG_FILE_MAPPINGS=( "$@" )
+
+if [[ "$((${#PARG_FILE_MAPPINGS[@]}%2))" -eq 1 ]] ; then
+    echo "Each SOURCE-FILE must have a TARGET-FILE!" <&2
+    echo "" >&2
+    print_usage >&2
+    exit 1
+fi
+
+if [[ -e "$PARG_OUTPUT" && ! -f "$PARG_OUTPUT" ]] ; then
+    echo "Not a regular file: $PARG_OUTPUT" >&2
+    echo "For details: $0 -h" >&2
+    exit 1
+fi
+
+if [[ "$PARG_SIZE" = "AUTO" ]] ; then
+    mapfile -t INPUT_FILE <<<$(for_each_file_mapping enumerate_input_files)
+    TARGET_SIZE="$(stat --dereference --printf="( (%s+1024-1)&~(1024-1) )+" "${INPUT_FILE[@]}") 0"
+    TARGET_SIZE=$(( TARGET_SIZE + CFG_FAT_OVERHEAD*${#INPUT_FILE[@]} ))
+    [[ "$TARGET_SIZE" -lt "$CFG_MIN_AUTO" ]] && TARGET_SIZE="$CFG_MIN_AUTO"
+else
+    TARGET_SIZE="$PARG_SIZE"
+fi
+readonly TARGET_SIZE
+printf "" > "$PARG_OUTPUT"
+truncate --size "$TARGET_SIZE" "$PARG_OUTPUT"
+mkfs.vfat "$PARG_OUTPUT" ${PARG_VOLUME_NAME:+-n "$PARG_VOLUME_NAME"} > /dev/null
+printf "${0##*/}: Creating image..." ; for_each_file_mapping add_to_output ; echo
+printf "${0##*/}: " ; LC_ALL=C mdir -i "$PARG_OUTPUT" ::. | sed -nre 's#^[[:blank:]]*(.* bytes free)$#\1#p'

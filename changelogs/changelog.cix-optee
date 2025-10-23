@@ -1,0 +1,5 @@
+cix-optee (3.17.0+2503.orangepi) bookworm; urgency=medium
+
+  * Init cix-optee
+
+ -- Cix Technology Group Co., Ltd <https://www.cixtech.com>  Tue, 21 Jan 2025 17:51:43 +0800

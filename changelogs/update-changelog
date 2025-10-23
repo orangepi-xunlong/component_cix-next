@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if ! dpkg -l | grep -qw devscripts; then
+    sudo apt install -y devscripts
+fi
+
+export DEBFULLNAME="Cix Technology Group Co., Ltd"
+export DEBEMAIL="https://www.cixtech.com"
+
+dch -i -D bookworm -c $1

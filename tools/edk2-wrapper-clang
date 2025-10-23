@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+# Copyright (c) 2022 Arm Limited. All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+exec "$(dirname ${BASH_SOURCE[0]})/../../tools/clang/bin/clang" "$@" -target aarch64-none-linux-gnu
+

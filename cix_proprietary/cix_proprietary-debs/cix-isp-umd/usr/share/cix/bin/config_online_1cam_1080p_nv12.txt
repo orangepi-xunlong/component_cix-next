@@ -1,0 +1,20 @@
+#set log level
+log:levelMask=0x3333333333,ispMask=0xffffffffffffffff,sw3aMask=0x7
+
+#set test case
+set:camid=0,pWidth=1920,pHeight=1080,vWidth=1920,vHeight=1080,vFmt=NV12,fps=30
+
+#start running
+start
+
+#dump 5frames
+dump:camid=0,num=5,period=5
+
+#continue 30s
+sleep:time=30
+
+#stop running
+stop
+
+#exit running
+exit

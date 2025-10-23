@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+
+# Copyright (c) 2022 Arm Limited. All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+### NOTE: All sizes in this script are in LBA unless explicitly stated otherwise ###
+
+print_usage() {
+    cat <<EOF
+Usage:
+    $0 -o OUTPUT PART...
+    $0 -h
+Create disk image OUTPUT with GPT partition scheme.
+
+OUTPUT must be a regular file (not a block device) and will be replaced if it
+already exists.
+
+PART describe each partition TYPE:NAME:FILE.
+  TYPE -
+    ESP      - EFI System partition.
+    LINUX    - Linux filesystem data (default when TYPE is the empty string).
+    GUID=XXX - Use XXX as the type GUID.
+  NAME partition name (max 36 characters and empty string is valid)
+  FILE Path to the partition data. Partition size is derived from FILE size.
+
+Example:
+  Create a GPT disk image with one ESP with no name and a partition named "foo bar".
+  $ $0 -o disk.img ESP::esp.img ":foo bar:foo.img"
+EOF
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+set -e
+set -u
+
+# this script have only been tested with LBA == 512
+readonly LBA="512"
+
+# partition start alignment (except for first partition that always start at LBA 2048)
+readonly PART_START_ALIGNMENT="1048576/LBA"
+
+OUTPUT=""
+while getopts "ho:" opt; do
+    case $opt in
+    ("o") OUTPUT="$OPTARG" ;;
+    ("h")
+        print_usage
+        exit 0
+        ;;
+    ("?")
+        print_usage >&2
+        exit 1
+    esac
+done
+shift $((OPTIND-1))
+readonly OUTPUT
+
+if [[ -z "$OUTPUT" ]] ; then
+    echo "ERROR: Mandatory -o not given!" >&2
+    echo "" >&2
+    print_usage >&2
+    exit 1
+fi
+readonly OUTPUT
+
+if [[ -e "$OUTPUT" && ! -f "$OUTPUT" ]] ; then
+    echo "ERROR: Not a regular file: $OUTPUT" >&2
+    echo "" >&2
+    print_usage >&2
+    exit 1
+fi
+
+PART_FILE=( )
+PART_NAME=( )
+PART_SIZE=( )
+PART_START=( )
+PART_TYPE=( )
+
+# the first partition start at this LBA
+NEXT_PART_START="2048"
+for (( NUM_OF_PARTS=0 ; $#>0 ; NUM_OF_PARTS++ )) ; do
+    [[ "$1" =~ ^([^:]*):([^:]*):(.+)$ ]] || die "Failed to parse partition string: $1"
+    shift
+    TYPE="${BASH_REMATCH[1]}"
+    NAME="${BASH_REMATCH[2]}"
+    FILE="${BASH_REMATCH[3]}"
+
+    case "${TYPE^^}" in
+    ("") ;&
+    ("LINUX")  TYPE="0FC63DAF-8483-4772-8E79-3D69D8477DE4" ;;
+    ("ESP")    TYPE="C12A7328-F81F-11D2-BA4B-00A0C93EC93B" ;;
+    ("GUID="*) TYPE="${TYPE#GUID=}" ;;
+    (*) die "Unknown type: $TYPE"
+    esac
+
+    [[ "${#NAME}" -gt 36 ]] && die "Name too long: \"$NAME\""
+
+    START="$NEXT_PART_START"
+    SIZE="$(stat --dereference --format="%s" "$FILE")"
+    if [[ "$SIZE" -eq 0 ]] ; then
+        echo "ERROR: Zero byte partitions not allowed: $FILE" >&2
+        exit 1
+    fi
+    # bytes -> sectors
+    SIZE=$(( (SIZE + LBA - 1) / LBA ))
+
+    NEXT_PART_START=$(( ( (NEXT_PART_START + SIZE) + (PART_START_ALIGNMENT-1) ) & ~(PART_START_ALIGNMENT-1) ))
+    PART_FILE+=( "$FILE" )
+    PART_NAME+=( "$NAME" )
+    PART_SIZE+=( "$SIZE" )
+    PART_START+=( "$START" )
+    PART_TYPE+=( "$TYPE" )
+done
+
+# 33 extra LBA is the backup at the end
+readonly \
+    DISK_SIZE="$(( LBA*(NEXT_PART_START + 33) ))" \
+    NUM_OF_PARTS \
+    PART_FILE \
+    PART_NAME \
+    PART_SIZE \
+    PART_START \
+    PART_TYPE \
+
+: > "$OUTPUT"
+truncate --size "$DISK_SIZE" "$OUTPUT"
+{
+    echo "label: gpt"
+    for (( i=0 ; i<NUM_OF_PARTS ; i++ )); do
+        echo "start=${PART_START[i]}, size=${PART_SIZE[i]}, name=\"${PART_NAME[i]}\", type=${PART_TYPE[i]}"
+    done
+} | sfdisk -q "$OUTPUT"
+
+for (( i=0 ; i<NUM_OF_PARTS ; i++ )); do
+    echo "writing partition $i:"
+    dd if="${PART_FILE[$i]}" of="$OUTPUT" seek="$(( PART_START[i]*LBA ))" bs=8M conv=notrunc,sparse oflag=seek_bytes status=progress
+    echo
+done

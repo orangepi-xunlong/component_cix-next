@@ -1,0 +1,15 @@
+[Unit]
+Description=ISP Daemon
+After=network.target load-isp-modules.service
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH="/usr/share/cix/lib"
+ExecStart=/usr/share/cix/bin/isp_app -c &
+Restart=always
+RestartSec=1
+StartLimitInterval=10
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
