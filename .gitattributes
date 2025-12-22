@@ -1,5 +1,0 @@
-cix_proprietary/cix_proprietary-debs/cix-gpu-umd/opt/cixgpu-pro/lib/aarch64-linux-gnu/libmali.so.0.53.0 filter=lfs diff=lfs merge=lfs -text
-debs/chromium_128.0.6613.84-1~deb12u1_arm64.deb filter=lfs diff=lfs merge=lfs -text
-debs/cix-npu-onnxruntime_1.1.0_arm64.deb filter=lfs diff=lfs merge=lfs -text
-cix_proprietary/cix_proprietary-debs/cix-gpu-umd/usr/share/cix/bin/clang filter=lfs diff=lfs merge=lfs -text
-cix_proprietary/cix_proprietary-debs/cix-gpu-umd/usr/bin/mali_clcc filter=lfs diff=lfs merge=lfs -text

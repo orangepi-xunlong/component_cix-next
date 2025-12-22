@@ -9,3 +9,4 @@
 *.ko
 *.mod
 *.mod.c
+debs/cix-npu-onnxruntime_1.1.0_arm64.deb
