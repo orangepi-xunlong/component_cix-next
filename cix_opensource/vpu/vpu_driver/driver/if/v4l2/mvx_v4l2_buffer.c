@@ -346,6 +346,9 @@ static int update_mvx_buffer(struct mvx_v4l2_buffer *vbuf)
     }
 #endif
 
+    mvx_buf->is_contiguous =
+        is_contiguous_planes(vport->port->pixelformat, vb2->memory);
+
     for (i = 0; i < vb2->num_planes; i++) {
         unsigned int offset = vb2->planes[i].data_offset;
 
@@ -361,11 +364,11 @@ static int update_mvx_buffer(struct mvx_v4l2_buffer *vbuf)
                         vb2->planes[i].bytesused - offset, offset);
         if (ret != 0)
             return ret;
-        mvx_buf->planes[i].length = vb2->planes[i].length;
+        if (mvx_buf->is_contiguous)
+            mvx_buf->planes[i].length = vb2->planes[i].length - offset;
+        else
+            mvx_buf->planes[i].length = vb2->planes[i].length;
     }
-
-    mvx_buf->is_contiguous =
-        is_contiguous_planes(vport->port->pixelformat, vb2->memory);
 
     ret = update_mvx_flags(mvx_buf, to_vb2_buf(vbuf));
     if (ret != 0)

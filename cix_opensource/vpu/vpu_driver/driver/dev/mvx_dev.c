@@ -55,6 +55,8 @@
 #include <linux/devfreq.h>
 #include <linux/devfreq-event.h>
 #include <linux/scmi_protocol.h>
+#include <linux/pm_qos.h>
+#include <linux/cpufreq.h>
 
 #include "mvx_bitops.h"
 #include "mvx_dev.h"
@@ -104,6 +106,13 @@ struct mvx_freq_table {
     unsigned int cores;
     unsigned long load;
     unsigned long freq;
+    unsigned int cpufreq;
+};
+
+struct mvx_cpufreq_req {
+    struct list_head req_list;
+    int cpu_id;
+    struct freq_qos_request min_freq_req;
 };
 
 /**
@@ -130,6 +139,8 @@ struct mvx_dev_ctx {
     struct devfreq_dev_profile devfreq_profile;
     struct devfreq *devfreq;
     unsigned long target_freq;
+    unsigned int target_cpufreq;
+    struct list_head cpufreq_req_list;
 };
 
 /**
@@ -150,12 +161,12 @@ const char * const vpu_pmdomains[MVX_MAX_NUMBER_OF_PMDOMAINS] = {
     "vpu_top", "vpu_core0", "vpu_core1", "vpu_core2", "vpu_core3"};
 
 static const struct mvx_freq_table sky1_mvx_freq_table[] = {
-    {4, 486000,  150000000},        // 1080P@60
-    {4, 972000,  300000000},        // 1080P@120
-    {4, 1458000, 480000000},        // 1080P@180
-    {4, 2073600, 600000000},        // 4K@60
-    {4, 4147200, 800000000},        // 4K@120
-    {4, 8294400, 1200000000},       // 8K@60
+    {4, 486000,  150000000, 1000000},        // 1080P@60
+    {4, 972000,  300000000, 1200000},        // 1080P@120
+    {4, 1458000, 480000000, 1300000},        // 1080P@180
+    {4, 2073600, 600000000, 1400000},        // 4K@60
+    {4, 4147200, 800000000, 1700000},        // 4K@120
+    {4, 8294400, 1200000000, 2000000},       // 8K@60
 };
 
 static struct mvx_dev_ctx *client_ops_to_ctx(struct mvx_client_ops *client)
@@ -216,6 +227,56 @@ static unsigned int get_core_mask(struct mvx_client_ops *client)
     return mvx_hwreg_get_core_mask(&ctx->hwreg);
 }
 
+static int mvx_cpufreq_init(struct mvx_dev_ctx *ctx)
+{
+    int ret;
+    struct mvx_cpufreq_req *req;
+    struct cpufreq_policy *policy;
+    int core = 0;
+
+    INIT_LIST_HEAD(&ctx->cpufreq_req_list);
+
+    do{
+        policy = cpufreq_cpu_get(core);
+        if (policy == NULL)
+            break;
+
+        req =  kzalloc(sizeof(struct mvx_cpufreq_req), GFP_KERNEL);
+        req->cpu_id = core;
+        ret = freq_qos_add_request(&policy->constraints, &req->min_freq_req, FREQ_QOS_MIN, 0);
+        if (ret < 0) {
+            kfree(req);
+            goto next_core;
+        }
+        list_add_tail(&req->req_list, &ctx->cpufreq_req_list);
+
+next_core:
+        cpufreq_cpu_put(policy);
+        core++;
+    }while(core < num_present_cpus());
+
+    return 0;
+}
+
+static void set_min_cpufreq(struct mvx_dev_ctx *ctx, int freq)
+{
+    struct mvx_cpufreq_req *req;
+    struct mvx_cpufreq_req *tmp;
+    list_for_each_entry_safe(req, tmp, &ctx->cpufreq_req_list, req_list) {
+        freq_qos_update_request(&req->min_freq_req, freq);
+    }
+}
+
+static void mvx_cpufreq_remove(struct mvx_dev_ctx *ctx)
+{
+    struct mvx_cpufreq_req *req;
+    struct mvx_cpufreq_req *tmp;
+    list_for_each_entry_safe(req, tmp, &ctx->cpufreq_req_list, req_list) {
+        freq_qos_remove_request(&req->min_freq_req);
+        list_del(&req->req_list);
+        kfree(req);
+    }
+}
 
 static int update_freq(struct mvx_dev_ctx *ctx)
 {
@@ -223,6 +284,7 @@ static int update_freq(struct mvx_dev_ctx *ctx)
     unsigned long mbs_per_sec;
     struct mvx_freq_table highest = sky1_mvx_freq_table[ARRAY_SIZE(sky1_mvx_freq_table) - 1];
     int freq = 0;
+    int cpufreq = 0;
     int ret;
     int i, j;
 
@@ -232,11 +294,15 @@ static int update_freq(struct mvx_dev_ctx *ctx)
 
     if (mbs_per_sec > highest.load) {
         freq = highest.freq;
+        cpufreq = highest.cpufreq;
+    } else if (mbs_per_sec == 0) {
+        cpufreq = 0;
     } else {
         active_ncores = mvx_hwreg_get_ncores(&ctx->hwreg);
         for (i = 0; i < ARRAY_SIZE(sky1_mvx_freq_table); i++) {
             if (sky1_mvx_freq_table[i].load >= mbs_per_sec) {
                 freq = sky1_mvx_freq_table[i].freq * sky1_mvx_freq_table[i].cores / active_ncores;
+                cpufreq = sky1_mvx_freq_table[i].cpufreq;
                 if (active_ncores == sky1_mvx_freq_table[i].cores)
                     break;
                 if (freq > highest.freq) {
@@ -255,6 +321,7 @@ static int update_freq(struct mvx_dev_ctx *ctx)
     }
 
     ctx->target_freq = freq;
+    ctx->target_cpufreq = cpufreq;
 
     return ret;
 }
@@ -377,8 +444,21 @@ static int send_irq(struct mvx_client_session *csession)
 
 int soft_irq(struct mvx_client_session *csession)
 {
-    struct mvx_dev_ctx *ctx = csession->ctx;
+    struct mvx_dev_ctx *ctx;
     int ret;
+
+    if (!csession) {
+        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_ERROR,
+                "soft trigger irq,but csession has been released");
+        return -EFAULT;
+    }
+
+    ctx = csession->ctx;
+    if (!ctx) {
+        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_ERROR,
+                "soft trigger irq,but context has been released");
+        return -EFAULT;
+    }
 
     MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_INFO,
               "%px soft trigger irq. csession=0x%px.",
@@ -473,7 +553,7 @@ static int mvx_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
     struct dev_pm_opp *opp;
     unsigned long pre_freq;
     unsigned long target_freq = *freq;
-    int ret;
+    int ret = 0;
 
     opp = devfreq_recommended_opp(dev, freq, flags);
     if (IS_ERR(opp)) {
@@ -483,8 +563,13 @@ static int mvx_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
     }
     dev_pm_opp_put(opp);
     pre_freq = scmi_device_get_freq(ctx->opp_pmdomain);
+    if (pre_freq == target_freq)
+        return ret;
+
     ret = scmi_device_set_freq(ctx->opp_pmdomain, *freq);
     atomic_set(&mvx_log_perf.freq, *freq);
+
+    set_min_cpufreq(ctx, ctx->target_cpufreq);
 
     MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_DEBUG, "%s() target=%ld, previous=%ld, current=%ld.",
                     __func__, target_freq, pre_freq, *freq);
@@ -842,6 +927,10 @@ static int mvx_dev_probe(struct device *dev,
 
     INIT_WORK(&ctx->work, irq_bottom);
 
+    ret = mvx_cpufreq_init(ctx);
+    if (ret)
+        goto workqueue_destroy;
+
     ret = mvx_devfreq_init(ctx);
     if (ret)
         goto workqueue_destroy;
@@ -864,6 +953,8 @@ static int mvx_dev_probe(struct device *dev,
 
 devfreq_remove:
     mvx_devfreq_remove(ctx);
+    mvx_cpufreq_remove(ctx);
+
 
 workqueue_destroy:
     destroy_workqueue(ctx->work_queue);
@@ -911,6 +1002,7 @@ static int mvx_dev_remove(struct mvx_dev_ctx *ctx)
 
     free_irq(ctx->irq, ctx);
     mvx_devfreq_remove(ctx);
+    mvx_cpufreq_remove(ctx);
     if (has_acpi_companion(ctx->dev)) {
 #if VPU_CORE_ACPI_REF_POWERSOURCE
         for (i = 1; i < ctx->pmdomains_cnt; i++) {
@@ -977,9 +1069,29 @@ static int mvx_hw_init(struct device *dev)
         return 0;
 
     MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_INFO, "hardware init");
+
+    /* MVE soft reset. */
+    mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_RESET, 1);
+    /* Clear CLKFORCE */
+    if (mvx_log_perf.enabled & MVX_LOG_PERF_UTILIZATION) {
+        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_INFO,
+            "Force enable core scheduler clock for performance profiling.");
+        mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_CLKFORCE, 1 << MVE_CLKFORCE_SCHED_CLK_SHIFT);
+    } else {
+        mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_CLKFORCE, 0);
+    }
+
     mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_BUSCTRL,
                     busctrl_ref << MVE_BUSTCTRL_REF_SHIFT |
                     busctrl_split);
+    return 0;
+}
+
+static int mvx_hw_uninit(struct device *dev)
+{
+    if (mvx_log_perf.drain && mvx_log_perf.drain->reset)
+        mvx_log_perf.drain->reset(mvx_log_perf.drain);
+
     return 0;
 }
 
@@ -997,19 +1109,6 @@ static int mvx_switch_enpwoff(struct mvx_dev_ctx *ctx, bool enable)
     reg = mvx_hwreg_read_rcsu(&ctx->hwreg, MVX_RCSU_HWREG_STRAP_PIN0);
     reg = (reg & ((1 << MVX_RCSU_HWREG_ENPWOFF_SHIFT) - 1)) | (val << MVX_RCSU_HWREG_ENPWOFF_SHIFT);
     mvx_hwreg_write_rcsu(&ctx->hwreg, MVX_RCSU_HWREG_STRAP_PIN0, reg);
-
-    /* MVE soft reset. */
-    mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_RESET, 1);
-    /* Clear CLKFORCE, then vpu can automatically power off core if ENPWOFF is enable. */
-    if (mvx_log_perf.enabled & MVX_LOG_PERF_UTILIZATION) {
-        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_INFO,
-            "Force enable core scheduler clock for performance profiling.");
-        mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_CLKFORCE, 1 << MVE_CLKFORCE_SCHED_CLK_SHIFT);
-        if (!enable && mvx_log_perf.drain && mvx_log_perf.drain->reset)
-            mvx_log_perf.drain->reset(mvx_log_perf.drain);
-    } else {
-        mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_CLKFORCE, 0);
-    }
 
     return 0;
 }
@@ -1040,6 +1139,10 @@ static int mvx_pm_runtime_suspend(struct device *dev)
     MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_INFO, "mvx_pm_runtime_suspend");
 
     mvx_if_flush_work(ctx->if_ops);
+
+    if (!disable_dfs && ctx->devfreq)
+        devfreq_suspend_device(ctx->devfreq);
+
     ret = mvx_sched_suspend(&ctx->scheduler);
     disable_irq(ctx->irq);
 
@@ -1054,6 +1157,8 @@ static int mvx_pm_runtime_suspend(struct device *dev)
         cancel_work_sync(&ctx->work);
     mvx_sched_cancel_work(&ctx->scheduler);
 
+    mvx_hw_uninit(dev);
+
     mvx_switch_qchannel_clock_gating(ctx, false);
 
     if (ctx->hwreg.hw_ver.svn_revision == MVE_SVN_ENPWOFF) {
@@ -1062,6 +1167,8 @@ static int mvx_pm_runtime_suspend(struct device *dev)
         usleep_range(10, 20);
         reset_control_deassert(ctx->rstc);
         mvx_switch_enpwoff(ctx, true);
+        /* Clear CLKFORCE then vpu can automatically power off */
+        mvx_hwreg_write(&ctx->hwreg, MVX_HWREG_CLKFORCE, 0);
     }
 
     if (!IS_ERR_OR_NULL(ctx->clk))
@@ -1153,6 +1260,9 @@ static int mvx_pm_runtime_resume(struct device *dev)
 
     if (IS_ERR_OR_NULL(ctx->scheduler.dev))
         return ret;
+
+    if (!disable_dfs && ctx->devfreq)
+        devfreq_resume_device(ctx->devfreq);
 
     queue_work(ctx->work_queue, &ctx->work);
     ret = mvx_sched_resume(&ctx->scheduler);

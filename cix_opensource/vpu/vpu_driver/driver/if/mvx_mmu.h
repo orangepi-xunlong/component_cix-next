@@ -111,6 +111,7 @@ enum mvx_mmu_access {
  * @capacity:    Maximum number of MVE pages this object can hold.
  * @count:    Current number of allocated pages.
  * @is_external:If the physical pages have been externally allocated.
+ * @rpc_mem_region:    RPC memory region.
  * @dmabuf:    List of DMA buffers.
  * @pages:    Array of pages.
  */
@@ -125,6 +126,7 @@ struct mvx_mmu_pages {
     size_t capacity;
     size_t count;
     bool is_external;
+    uint8_t rpc_mem_region;
     struct list_head dmabuf;
     phys_addr_t pages[0];
 };

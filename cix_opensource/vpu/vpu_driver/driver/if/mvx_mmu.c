@@ -199,7 +199,7 @@ static mvx_mmu_pte *ptw(struct mvx_mmu *mmu,
             return ERR_PTR(-EFAULT);
         }
 
-        l2 = mvx_mmu_alloc_page(mmu->dev, GFP_KERNEL | __GFP_ZERO);
+        l2 = mvx_mmu_alloc_page(mmu->dev, GFP_KERNEL | __GFP_ZERO | __GFP_RETRY_MAYFAIL);
         if (l2 == 0) {
             MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
                       "Failed to allocate L2 page. va=0x%x.",
@@ -606,7 +606,7 @@ int mvx_mmu_construct(struct mvx_mmu *mmu,
     mmu->dev = dev;
 
     /* Allocate Page Table Base (the L1 table). */
-    page_table = mvx_mmu_alloc_page(dev, GFP_KERNEL | __GFP_ZERO);
+    page_table = mvx_mmu_alloc_page(dev, GFP_KERNEL | __GFP_ZERO | __GFP_RETRY_MAYFAIL);
     if (page_table == 0)
         return -ENOMEM;
 
@@ -715,40 +715,77 @@ free_pages:
 void mvx_mmu_free_noncontiguous(struct device *dev,
               struct mvx_mmu_pages *pages, struct sg_table *sgt, void **data, size_t size)
 {
+    struct scatterlist *sg;
+    uint32_t i;
+
     dma_vunmap_noncontiguous(dev, *data);
-    dma_free_noncontiguous(dev, size, sgt, DMA_FROM_DEVICE);
+
+    for_each_sgtable_sg(sgt, sg, i) {
+        if (sg_page(sg))
+            __free_page(sg_page(sg));
+    }
+    sg_free_table(sgt);
+    kfree(sgt);
+
     vfree(pages);
 }
 
 void* mvx_mmu_alloc_noncontiguous(struct device *dev,
               struct mvx_mmu_pages **pages, struct sg_table **sgt, size_t size, gfp_t gfp_mask)
 {
-    void *data;
+    void *data = NULL;
     struct mvx_mmu_pages *tmp_pages;
     struct sg_table *tmp_sgt;
+    struct scatterlist *sg;
+    struct page *page;
+    uint32_t i;
+    int ret;
+    const uint32_t nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
 
-    tmp_sgt = dma_alloc_noncontiguous(dev,
-              size, DMA_FROM_DEVICE, gfp_mask, DMA_ATTR_ALLOC_SINGLE_PAGES);
-    if (tmp_sgt == NULL)
+    tmp_sgt = kmalloc(sizeof(*tmp_sgt), gfp_mask);
+    if (!tmp_sgt)
         return NULL;
+    ret = sg_alloc_table(tmp_sgt, nr_pages, gfp_mask);
+    if (ret) {
+        kfree(tmp_sgt);
+        return NULL;
+    }
+
+    sg = tmp_sgt->sgl;
+    for (i = 0; i < nr_pages; i++) {
+        page = alloc_page(gfp_mask);
+        if (!page)
+            goto free_pages;
+
+        sg_set_page(sg, page, PAGE_SIZE, 0);
+        sg = sg_next(sg);
+    }
 
     data = dma_vmap_noncontiguous(dev, size, tmp_sgt);
     if (data == NULL) {
         MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
                   "Cannot map sg_table to DMA address space");
-        goto free_sg_table;
+        goto free_pages;
     }
+
     tmp_pages = mvx_mmu_alloc_pages_sg(dev,
               tmp_sgt, DIV_ROUND_UP(size, MVE_PAGE_SIZE));
     if (IS_ERR(tmp_pages))
-        goto free_sg_table;
+        goto free_pages;
 
     *pages = tmp_pages;
     *sgt = tmp_sgt;
     return data;
 
-free_sg_table:
-    dma_free_noncontiguous(dev, size, tmp_sgt, DMA_FROM_DEVICE);
+free_pages:
+    if (data)
+        dma_vunmap_noncontiguous(dev, data);
+    for_each_sgtable_sg(tmp_sgt, sg, i) {
+        if (sg_page(sg))
+            __free_page(sg_page(sg));
+    }
+    sg_free_table(tmp_sgt);
+    kfree(tmp_sgt);
     return NULL;
 }
 
@@ -991,7 +1028,7 @@ int mvx_mmu_resize_pages(struct mvx_mmu_pages *pages,
         phys_addr_t page;
         unsigned int i;
 
-        page = mvx_mmu_alloc_page(pages->dev, GFP_KERNEL);
+        page = mvx_mmu_alloc_page(pages->dev, GFP_KERNEL | __GFP_RETRY_MAYFAIL);
         if (page == 0)
             return -ENOMEM;
 

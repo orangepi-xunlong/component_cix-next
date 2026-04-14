@@ -136,4 +136,12 @@ void mvx_secure_release_firmware(struct mvx_secure_firmware *securefw);
 struct dma_buf *mvx_secure_mem_alloc(struct mvx_secure *secure,
                      size_t size, int region);
 
+/**
+ * mvx_secure_init_vpu() - Initialize hardware for protected session.
+ * @secure:    Pointer to secure object.
+ *
+ * Return: 0 on success, else error code.
+ */
+int mvx_secure_init_vpu(struct mvx_secure *secure);
+
 #endif /* _MVX_SECURE_H_ */

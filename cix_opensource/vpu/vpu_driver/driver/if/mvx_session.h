@@ -475,6 +475,9 @@ struct mvx_session {
     uint32_t inter_ipenalty_planar;
     uint32_t inter_ipenalty_dc;
     struct mvx_lambda_scale lambda_scale;
+    uint32_t disable_timescale;
+    uint32_t pause_counter;
+    uint32_t fps_before_pause;
 };
 
 /****************************************************************************
@@ -1485,6 +1488,7 @@ int mvx_session_set_enc_intra_ipenalty_dc(struct mvx_session *session, int val);
 int mvx_session_set_enc_inter_ipenalty_angular(struct mvx_session *session, int val);
 int mvx_session_set_enc_inter_ipenalty_planar(struct mvx_session *session, int val);
 int mvx_session_set_enc_inter_ipenalty_dc(struct mvx_session *session, int val);
+int mvx_session_set_enc_disable_timescale(struct mvx_session *session, int val);
 /**
  * mvx_session_update_buffer_count() - Update session port buffer max and min.
  * @session:    Pointer to session.

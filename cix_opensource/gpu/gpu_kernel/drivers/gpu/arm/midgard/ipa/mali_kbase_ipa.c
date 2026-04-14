@@ -31,6 +31,8 @@
 #include <linux/pm_opp.h>
 #include <linux/mali_hw_access.h>
 #include <linux/acpi.h>
+#include "backend/gpu/mali_kbase_clk_rate_trace_mgr.h"
+#include "mali_kbase_config_platform.h"
 
 #define KBASE_IPA_FALLBACK_MODEL_NAME "mali-simple-power-model"
 
@@ -800,6 +802,40 @@ int kbase_get_real_power_locked(struct kbase_device *kbdev, u32 *power, unsigned
 
 	return err;
 }
+
+#define GPU_POWER_MODEL_ENABLE_THRESHOLD 20
+extern bool enable_sky1_power_model;
+
+static u32 get_normalized_gpu_usage(struct kbase_device *kbdev)
+{
+	struct kbasep_pm_metrics diff;
+	u32 total_time, utilisation;
+	u32 cur_compute_power, max_compute_power;
+	u32 cur_freq_mhz, cur_cores;
+	u32 max_cores, max_freq_mhz;
+	u32 normalized_utilisation;
+
+	kbase_pm_get_dvfs_metrics(kbdev, &kbdev->ipa.last_metrics, &diff);
+	total_time = diff.time_busy + diff.time_idle;
+	if (unlikely(total_time == 0))
+		utilisation = 0;
+	else
+		utilisation = (100 * diff.time_busy) / total_time;
+
+	cur_freq_mhz = clk_get_rate(kbdev->clocks[0]) / 1000000;
+	cur_cores = hweight64(kbdev->pm.backend.shaders_avail);
+	max_freq_mhz = kbdev->devfreq_table[kbdev->num_opps - 1].real_freqs[0] / 1000000;
+	max_cores = hweight64(kbdev->gpu_props.shader_present);
+
+	cur_compute_power = cur_cores * cur_freq_mhz;
+	max_compute_power = max_cores * max_freq_mhz;
+	if (unlikely(max_compute_power == 0))
+		normalized_utilisation = utilisation;
+	else
+		normalized_utilisation = (utilisation * cur_compute_power) / max_compute_power;
+
+	return normalized_utilisation;
+}
 #endif /* IS_ENABLED(CONFIG_MALI_CIX_POWER_MODEL) */
 KBASE_EXPORT_TEST_API(kbase_get_real_power_locked);
 
@@ -815,6 +851,25 @@ int kbase_get_real_power(struct devfreq *df, u32 *power, unsigned long freq, uns
 	ret = kbase_get_real_power_locked(kbdev, power, freq, voltage);
 	mutex_unlock(&kbdev->ipa.lock);
 
+#if IS_ENABLED(CONFIG_MALI_CIX_POWER_MODEL)
+	if(enable_sky1_power_model && kbdev->sky1_power_timer.function) {
+		u32 normalized_utilisation = get_normalized_gpu_usage(kbdev);
+
+		if(normalized_utilisation < GPU_POWER_MODEL_ENABLE_THRESHOLD) {
+			if(hrtimer_active(&kbdev->sky1_power_timer)) {
+				dev_dbg(kbdev->dev, "Stop GPU power model timer");
+				hrtimer_cancel(&kbdev->sky1_power_timer);
+				mali_writel(0, kbdev->dynamic_power_addr);
+			}
+		} else {
+			if(!hrtimer_active(&kbdev->sky1_power_timer)) {
+				dev_dbg(kbdev->dev, "Start GPU power model timer");
+				hrtimer_start(&kbdev->sky1_power_timer,
+						HR_TIMER_DELAY_MSEC(PM_POWER_MODEL_SAMPLE_INTERVAL_MS), HRTIMER_MODE_REL);
+				}
+		}
+	}
+#endif
 	return ret;
 }
 KBASE_EXPORT_TEST_API(kbase_get_real_power);

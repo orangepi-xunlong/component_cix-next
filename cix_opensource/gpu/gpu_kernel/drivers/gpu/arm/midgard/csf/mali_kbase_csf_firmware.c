@@ -2373,9 +2373,8 @@ int kbase_csf_firmware_early_init(struct kbase_device *kbdev)
 		(kbdev->reg_size - CSF_HW_DOORBELL_PAGE_OFFSET) / CSF_HW_DOORBELL_PAGE_SIZE;
 
 	if (!kbdev->csf.num_doorbells || (kbdev->csf.num_doorbells > CSF_NUM_DOORBELL_MAX)) {
-		dev_err(kbdev->dev, "Invalid number of doorbell pages: %u",
+		dev_warn(kbdev->dev, "Invalid number of doorbell pages: %u",
 			kbdev->csf.num_doorbells);
-		return -EINVAL;
 	}
 
 	init_waitqueue_head(&kbdev->csf.event_wait);

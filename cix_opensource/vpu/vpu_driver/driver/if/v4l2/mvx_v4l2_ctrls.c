@@ -957,6 +957,10 @@ static int set_ctrl(struct v4l2_ctrl *ctrl)
         i32_val = *ctrl->p_new.p_s32;
         ret = mvx_session_set_enc_inter_ipenalty_dc(session, i32_val);
         break;
+    case V4L2_CID_MVE_VIDEO_ENC_DISABLE_TIMESCALE:
+        i32_val = *ctrl->p_new.p_s32;
+        ret = mvx_session_set_enc_disable_timescale(session, i32_val);
+        break;
     }
 unlock_mutex:
     mutex_unlock(&vsession->mutex);
@@ -2105,10 +2109,6 @@ int mvx_v4l2_ctrls_init_enc(struct v4l2_ctrl_handler *hnd)
     if (ctrl == NULL)
         goto handler_free;
 
-    ret = v4l2_ctrl_handler_setup(hnd);
-    if (ret != 0)
-        goto handler_free;
-
     ctrl = mvx_v4l2_ctrl_new_custom_int(
         hnd, V4L2_CID_MVE_VIDEO_ENC_INTRA_IPENALTY_ANGULAR,
         "intra ipenalty angular",
@@ -2151,6 +2151,16 @@ int mvx_v4l2_ctrls_init_enc(struct v4l2_ctrl_handler *hnd)
     if (ctrl == NULL)
         goto handler_free;
 
+    ctrl = mvx_v4l2_ctrl_new_custom_int(
+            hnd, V4L2_CID_MVE_VIDEO_ENC_DISABLE_TIMESCALE,
+            "disable timescale in vui",
+            0, 1, 0, 1);
+    if (ctrl == NULL)
+        goto handler_free;
+
+    ret = v4l2_ctrl_handler_setup(hnd);
+    if (ret != 0)
+        goto handler_free;
     return 0;
 
 handler_free:

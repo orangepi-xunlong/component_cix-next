@@ -756,68 +756,6 @@ static bool is_stream_on(struct mvx_session *session)
         return session->port[MVX_DIR_INPUT].stream_on;
 }
 
-/**
- * wait_pending() - Wait for procedure to finish.
- *
- * Wait for the number of pending firmware messages to reach 0, or for an error
- * to happen.
- *
- * Return: 0 on success, else error code.
- */
-static int wait_pending(struct mvx_session *session)
-{
-    int ret = 0;
-
-    while (is_fw_loaded(session) != false &&
-           session->fw.msg_pending > 0 &&
-           session->error == 0) {
-        mutex_unlock(session->isession.mutex);
-
-        ret = wait_event_timeout(
-            session->waitq,
-            is_fw_loaded(session) == false ||
-            session->fw.msg_pending == 0 ||
-            session->error != 0,
-            msecs_to_jiffies(wait_pending_timeout));
-
-        if (ret == 0) {
-            MVX_SESSION_WARN(session,
-                "Wait pending returned timeout, msg_pending=%d. try again.",
-                session->fw.msg_pending);
-            session->client_ops->soft_irq(session->csession);
-            ret = wait_event_timeout(
-                session->waitq,
-                is_fw_loaded(session) == false ||
-                session->fw.msg_pending == 0 ||
-                session->error != 0,
-                msecs_to_jiffies(wait_pending_timeout));
-
-            if (ret == 0) {
-                send_event_error(session, -ETIME);
-                ret = -ETIME;
-                goto lock_mutex;
-            }
-        }
-
-        if (ret < 0)
-            goto lock_mutex;
-
-        mutex_lock(session->isession.mutex);
-    }
-
-    return session->error;
-
-lock_mutex:
-    mutex_lock(session->isession.mutex);
-
-    if (ret < 0)
-        MVX_SESSION_WARN(session,
-                 "Wait pending returned error. ret=%d, error=%d, msg_pending=%d.",
-                 ret, session->error, session->fw.msg_pending);
-
-    return ret;
-}
-
 static int send_irq(struct mvx_session *session)
 {
     if (IS_ERR_OR_NULL(session->csession))
@@ -970,6 +908,69 @@ static int fw_switch_out(struct mvx_session *session)
      * want to reset the idle counter.
      */
     session->idle_count = idle_count;
+
+    return ret;
+}
+
+/**
+ * wait_pending() - Wait for procedure to finish.
+ *
+ * Wait for the number of pending firmware messages to reach 0, or for an error
+ * to happen.
+ *
+ * Return: 0 on success, else error code.
+ */
+static int wait_pending(struct mvx_session *session)
+{
+    int ret = 0;
+
+    while (is_fw_loaded(session) != false &&
+           session->fw.msg_pending > 0 &&
+           session->error == 0) {
+        mutex_unlock(session->isession.mutex);
+
+        ret = wait_event_timeout(
+            session->waitq,
+            is_fw_loaded(session) == false ||
+            session->fw.msg_pending == 0 ||
+            session->error != 0,
+            msecs_to_jiffies(wait_pending_timeout));
+
+        if (ret == 0) {
+            MVX_SESSION_WARN(session,
+                "Wait pending returned timeout, msg_pending=%d. try again.",
+                session->fw.msg_pending);
+            session->client_ops->soft_irq(session->csession);
+            ret = wait_event_timeout(
+                session->waitq,
+                is_fw_loaded(session) == false ||
+                session->fw.msg_pending == 0 ||
+                session->error != 0,
+                msecs_to_jiffies(wait_pending_timeout));
+
+            if (ret == 0) {
+                switch_out_rsp(session);
+                send_event_error(session, -ETIME);
+                ret = -ETIME;
+                goto lock_mutex;
+            }
+        }
+
+        if (ret < 0)
+            goto lock_mutex;
+
+        mutex_lock(session->isession.mutex);
+    }
+
+    return session->error;
+
+lock_mutex:
+    mutex_lock(session->isession.mutex);
+
+    if (ret < 0)
+        MVX_SESSION_WARN(session,
+                 "Wait pending returned error. ret=%d, error=%d, msg_pending=%d.",
+                 ret, session->error, session->fw.msg_pending);
 
     return ret;
 }
@@ -1911,7 +1912,8 @@ static int fw_encoder_setup(struct mvx_session *session)
             session->color_desc.transfer_characteristics != 2 ||
             session->color_desc.sar_height != 0 || session->color_desc.sar_width != 0 ||
             session->color_desc.aspect_ratio_idc != 0 ||
-            session->color_desc.flags != 0) {
+            session->color_desc.flags != 0 ||
+            (!session->disable_timescale && session->fps_d && session->fps_n)) {
             struct mvx_fw_set_option option;
 
             option.code = MVX_FW_SET_COLOUR_DESC;
@@ -3017,6 +3019,14 @@ static void fw_bin_ready(struct mvx_fw_bin *bin,
         goto unregister_csession;
     }
 
+    if (session->isession.securevideo) {
+        ret = mvx_secure_init_vpu(bin->secure.secure);
+        if (ret != 0) {
+            send_event_error(session, ret);
+            goto put_fw_bin;
+        }
+    }
+
     session->fw_bin = bin;
     complete(&session->fw_loaded);
 
@@ -3332,14 +3342,19 @@ static void watchdog_work(struct work_struct *work)
         print_debug(session);
         /* Request firmware to dump its state. */
         fw_dump(session);
-        session->client_ops->terminate(session->csession);
-        switch_out_rsp(session);
+        if (session->csession){
+            session->client_ops->terminate(session->csession);
+            switch_out_rsp(session);
+        }
         send_event_error(session, -ETIME);
     }
 
     ret = kref_put(&session->isession.kref, session->isession.release);
-    if (ret != 0)
+    if (ret != 0) {
+        if (mutex_is_locked(session->isession.mutex))
+            mutex_unlock(session->isession.mutex);
         return;
+    }
 
     mutex_unlock(session->isession.mutex);
 
@@ -6884,6 +6899,19 @@ int mvx_session_set_enc_inter_ipenalty_dc(struct mvx_session *session, int val)
         return -EBUSY;
 
     session->inter_ipenalty_dc = val;
+
+    return 0;
+}
+
+int mvx_session_set_enc_disable_timescale(struct mvx_session *session, int val)
+{
+   if (session->error != 0)
+        return session->error;
+
+    if (is_fw_loaded(session) != false)
+        return -EBUSY;
+
+    session->disable_timescale = val;
 
     return 0;
 }

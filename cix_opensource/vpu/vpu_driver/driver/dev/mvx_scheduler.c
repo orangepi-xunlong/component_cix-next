@@ -46,6 +46,7 @@
 #include "mvx_seq.h"
 #include "mvx_pm_runtime.h"
 #include "mvx_log_group.h"
+#include "mvx_secure.h"
 
 /****************************************************************************
  * Private variables
@@ -564,8 +565,10 @@ void mvx_sched_destruct(struct mvx_sched *sched)
 {
     destroy_workqueue(sched->sched_queue);
 
-    while (sched->nlsid-- > 0)
+    while (sched->nlsid > 0) {
+        sched->nlsid--;
         mvx_lsid_destruct(&sched->lsid[sched->nlsid]);
+    }
 }
 
 int mvx_sched_session_construct(struct mvx_sched_session *session,
@@ -715,6 +718,13 @@ int mvx_sched_send_irq(struct mvx_sched *sched,
 int mvx_sched_trigger_irq(struct mvx_sched *sched,
                struct mvx_sched_session *session)
 {
+    if (!sched || !session) {
+        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_ERROR,
+                    "shched when irq trigger,but sched %p,session %p",
+                    sched,session);
+        return -EFAULT;
+    }
+
     mutex_lock(&sched->mutex);
 
     if (session->lsid == NULL) {
@@ -878,6 +888,12 @@ void mvx_sched_terminate(struct mvx_sched *sched,
     struct list_head *head;
     struct list_head *tmp;
 
+    if (!sched || !session) {
+        MVX_LOG_PRINT(&mvx_log_dev, MVX_LOG_ERROR,
+                      "sched terminate, shced %p,session %p", sched, session);
+        return;
+    }
+
     mutex_lock(&sched->mutex);
 
     if (session->lsid != NULL) {
@@ -976,10 +992,21 @@ int mvx_sched_suspend(struct mvx_sched *sched)
 
 int mvx_sched_resume(struct mvx_sched *sched)
 {
+    struct mvx_sched_session *ss;
+    struct mvx_sched_session *tmp;
     int ret = 0;
 
     if (IS_ERR_OR_NULL(sched->dev))
         return ret;
+
+    mutex_lock(&sched->sessions_mutex);
+    list_for_each_entry_safe(ss, tmp, &sched->sessions, session) {
+        if (ss && ss->isession && ss->isession->securevideo) {
+            struct mvx_session *ls = mvx_if_session_to_session(ss->isession);
+            mvx_secure_init_vpu(ls->fw.fw_bin->secure.secure);
+        }
+    }
+    mutex_unlock(&sched->sessions_mutex);
 
     ret = mutex_lock_interruptible(&sched->mutex);
     if (ret != 0) {
@@ -1021,15 +1048,35 @@ static unsigned long calculate_session_load(struct mvx_session *session)
      */
     if (timespec64_to_ns(&delta) /  NSEC_PER_MSEC > 500) {
         buf_fps = port_in->buffers_in_window * NSEC_PER_SEC / timespec64_to_ns(&delta);
-        fps = (buf_fps > ((session->fps_n / session->fps_d) * 120 / 100)) ?
-                buf_fps : (session->fps_n / session->fps_d);
+        if (!buf_fps) {
+            session->pause_counter++;
+            if (session->last_fps)
+                session->fps_before_pause = session->last_fps;
+        } else {
+            session->pause_counter = 0;
+            session->fps_before_pause = 0;
+        }
+        /*
+         * if no buffers decode or encode in 2 second, may enter into pause
+         */
+        if (session->pause_counter <= 4)
+            fps = (buf_fps > ((session->fps_n / session->fps_d) * 120 / 100)) ?
+                    buf_fps : (session->fps_n / session->fps_d);
+        else
+            fps =0;
 
         port_in->buffers_in_window = 0;
         port_out->buffers_in_window = 0;
         session->last_timespec = now;
         session->last_fps = fps;
     } else {
-        fps = max(session->last_fps, session->fps_n / session->fps_d);
+        if (port_in->buffers_in_window && !session->last_fps)
+            session->last_fps = session->fps_before_pause;
+
+        if (session->last_fps)
+            fps = max(session->last_fps, session->fps_n / session->fps_d);
+        else
+            fps = 0;
     }
 
     // The performance of encode is half that of decode, we use decode as the benchmark.

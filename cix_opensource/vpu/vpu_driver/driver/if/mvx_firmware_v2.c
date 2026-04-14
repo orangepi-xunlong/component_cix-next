@@ -386,9 +386,10 @@ static int read_message(struct mvx_fw *fw,
             enum mvx_log_fwif_channel channel)
 {
     struct mve_msg_header header;
-    unsigned int rpos, prev_rpos;
+    unsigned int rpos, wpos, prev_rpos;
     ssize_t capacity;
     int integrity_check;
+    uint32_t sum, cur_sum;
     int ret;
 
     ret = mutex_lock_interruptible(&fw->mutex);
@@ -403,14 +404,20 @@ static int read_message(struct mvx_fw *fw,
 
     rpos = host->out_rpos;
     prev_rpos = rpos;
+    wpos = mve->out_wpos;
 
     /* Calculate how much data that is available in the buffer. */
-    if (mve->out_wpos >= rpos)
-        capacity = mve->out_wpos - rpos;
+    if (wpos >= rpos)
+        capacity = wpos - rpos;
     else
-        capacity = mve->out_wpos + MVE_COMM_QUEUE_SIZE_IN_WORDS - rpos;
+        capacity = wpos + MVE_COMM_QUEUE_SIZE_IN_WORDS - rpos;
 
-    if (capacity <= 0) {
+    if (capacity == 0) {
+        ret = 0;
+        goto out;
+    } else if (capacity < 0 || capacity > MVE_COMM_QUEUE_SIZE_IN_WORDS) {
+        MVX_LOG_PRINT(&mvx_log_if, MVX_WAR_LOG_LEVEL, "invalid capacity(%ld), rpos(%d), wpos(%d)",
+                        capacity,rpos,wpos);
         ret = 0;
         goto out;
     }
@@ -425,13 +432,12 @@ static int read_message(struct mvx_fw *fw,
         goto out;
     }
 
-
     /* Do integrity check only when VPU firmware sends checksum which is in the reserved fields */
     integrity_check = mve->reserved[0] || mve->reserved[1] || mve->reserved[2];
     if (integrity_check) {
         /* Message queue integrity check */
         if (channel == MVX_LOG_FWIF_CHANNEL_MESSAGE) {
-            uint32_t sum = sum32n(mve->out_data, prev_rpos, capacity);
+            sum = sum32n(mve->out_data, prev_rpos, capacity);
             sum += fw->msg_mve_sum;
             if (sum != mve->reserved[2] && sum != mve->reserved[1] && sum != mve->reserved[0]) {
                 MVX_LOG_PRINT(&mvx_log_if, MVX_WAR_LOG_LEVEL,
@@ -467,8 +473,7 @@ static int read_message(struct mvx_fw *fw,
     if (capacity < 0) {
         MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
                   "Firmware v2 msg larger than capacity. code=%u, size=%u, wpos=%u, rpos=%u.",
-                  header.code, header.size, mve->out_wpos,
-                  host->out_rpos);
+                  header.code, header.size, wpos, rpos);
         *code = 0;
         *size = 0;
         ret = 1;
@@ -483,12 +488,31 @@ static int read_message(struct mvx_fw *fw,
         goto out;
     }
 
-    /* Update message sum */
+    /* Calculate current message sum */
     if (integrity_check && channel == MVX_LOG_FWIF_CHANNEL_MESSAGE)
-        fw->msg_mve_sum += sum32n(mve->out_data, host->out_rpos, (header.size + 7) >> 2);
-
+        cur_sum = sum32n(mve->out_data, host->out_rpos, (header.size + 7) >> 2);
     /* Read message body. */
     rpos = read32n(mve->out_data, rpos, data, header.size);
+
+    if (integrity_check && channel == MVX_LOG_FWIF_CHANNEL_MESSAGE){
+        /* Do integrity check again */
+        sum = fw->msg_mve_sum + cur_sum;
+        sum += sum32n(mve->out_data, rpos, capacity);
+        if (sum != mve->reserved[2] && sum != mve->reserved[1] && sum != mve->reserved[0]) {
+            MVX_LOG_PRINT(&mvx_log_if, MVX_WAR_LOG_LEVEL,
+                    "Sanity check failed: %u vs %u. rpos = %d, size = %ld, header = 0x%08x(0x%08x)",
+                    sum, mve->reserved[2], prev_rpos, capacity,
+                    mve->out_data[prev_rpos], *(uint32_t *)&header);
+            *code = 0;
+            *size = 0;
+            ret = 1;
+            goto out;
+        }
+
+        /* Update message sum */
+        fw->msg_mve_sum += cur_sum;
+    }
+
     host->out_rpos = rpos;
 
     /*
@@ -565,7 +589,7 @@ static int write_message(struct mvx_fw *fw,
 {
     struct mve_msg_header header = { .code = code, .size = size };
     ssize_t capacity;
-    unsigned int wpos;
+    unsigned int rpos, wpos;
     int ret;
 
     ret = mutex_lock_interruptible(&fw->mutex);
@@ -578,10 +602,11 @@ static int write_message(struct mvx_fw *fw,
                 virt_to_phys(&mve->in_rpos),
                 sizeof(mve->in_rpos), DMA_FROM_DEVICE);
 
+    rpos = mve->in_rpos;
     wpos = host->in_wpos;
 
     /* Calculate how much space that is available in the buffer. */
-    capacity = mve->in_rpos - wpos;
+    capacity = rpos - wpos;
     if (capacity <= 0)
         capacity += MVE_COMM_QUEUE_SIZE_IN_WORDS;
 
@@ -1960,7 +1985,7 @@ static int put_message_v2(struct mvx_fw *fw,
         break;
     }
     case MVX_FW_CODE_JOB: {
-        struct mve_request_job job;
+        struct mve_request_job job = {0};
 
         job.cores = msg->job.cores;
         job.frames = msg->job.frames;
@@ -1986,7 +2011,7 @@ static int put_message_v2(struct mvx_fw *fw,
     case MVX_FW_CODE_SET_OPTION: {
         switch (msg->set_option.code) {
         case MVX_FW_SET_FRAME_RATE: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_FRAME_RATE;
             param.data.arg = msg->set_option.frame_rate;
@@ -1995,7 +2020,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_TARGET_BITRATE: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_RATE_CONTROL;
             if (msg->set_option.target_bitrate == 0) {
@@ -2014,7 +2039,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RATE_CONTROL_JPEG: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_JPEG_RC;
 
@@ -2026,7 +2051,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RATE_CONTROL: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_RATE_CONTROL;
             if (msg->set_option.rate_control.target_bitrate == 0) {
@@ -2050,7 +2075,7 @@ static int put_message_v2(struct mvx_fw *fw,
 
         }
         case MVX_FW_SET_CROP_LEFT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CROP_RARAM_LEFT;
             opt.data.arg = msg->set_option.crop_left;
@@ -2059,7 +2084,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CROP_RIGHT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CROP_RARAM_RIGHT;
             opt.data.arg = msg->set_option.crop_right;
@@ -2068,7 +2093,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CROP_TOP: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CROP_RARAM_TOP;
             opt.data.arg = msg->set_option.crop_top;
@@ -2078,7 +2103,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CROP_BOTTOM: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CROP_RARAM_BOTTOM;
             opt.data.arg = msg->set_option.crop_bottom;
@@ -2088,7 +2113,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RC_BIT_I_MODE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_RC_I_BIT_MODE;
             opt.data.arg = msg->set_option.rc_bit_i_mode;
@@ -2097,7 +2122,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RC_BIT_I_RATIO: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_RC_I_BIT_RATIO;
             opt.data.arg = msg->set_option.rc_bit_i_ratio;
@@ -2107,7 +2132,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_HRD_BUF_SIZE: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_RATE_CONTROL_HRD_BUF_SIZE;
             param.data.arg = msg->set_option.nHRDBufsize;
@@ -2116,7 +2141,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_COLOUR_DESC: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_COLOUR_DESCRIPTION;
             param.data.colour_description.flags = msg->set_option.colour_desc.flags;
@@ -2179,7 +2204,7 @@ static int put_message_v2(struct mvx_fw *fw,
 
         }
         case MVX_FW_SET_OSD_CONFIG: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             param.type = MVE_BUFFER_PARAM_TYPE_OSD_RECTANGLES;
             memcpy(&param.data.osd_rectangles_buff, &msg->set_option.osd_config.osd_single_cfg,
                     sizeof(param.data.osd_rectangles_buff));
@@ -2188,7 +2213,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_SEI_USERDATA: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             param.type = MVE_BUFFER_PARAM_TYPE_SEI_USER_DATA_UNREGISTERED;
             param.data.user_data_unregistered.user_data_len = msg->set_option.userdata.user_data_len;
             param.data.user_data_unregistered.flags = msg->set_option.userdata.flags;
@@ -2201,7 +2226,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_NALU_FORMAT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_NALU_FORMAT;
             ret = to_mve_nalu_format(msg->set_option.nalu_format,
@@ -2214,7 +2239,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_STREAM_ESCAPING: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_STREAM_ESCAPING;
             opt.data.arg = msg->set_option.stream_escaping ? 1 : 0;
@@ -2223,7 +2248,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_PROFILE_LEVEL: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_PROFILE_LEVEL;
             ret = fw->ops_priv.to_mve_profile(
@@ -2246,7 +2271,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_FSF_MODE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_AV1_FSF;
             opt.data.arg =
                 msg->set_option.fsf_mode ;
@@ -2255,7 +2280,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_IGNORE_STREAM_HEADERS: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_IGNORE_STREAM_HEADERS;
             opt.data.arg =
@@ -2264,7 +2289,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_FRAME_REORDERING: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_FRAME_REORDERING;
             opt.data.arg = msg->set_option.frame_reordering ? 1 : 0;
@@ -2272,7 +2297,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_INTBUF_SIZE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_INTBUF_SIZE;
             opt.data.arg = msg->set_option.intbuf_size;
@@ -2280,7 +2305,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_P_FRAMES: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_P_FRAMES;
             opt.data.arg = msg->set_option.pb_frames;
@@ -2288,7 +2313,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_PROFILING: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_PROFILING;
             opt.data.arg = msg->set_option.profiling;
@@ -2296,7 +2321,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_B_FRAMES: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_B_FRAMES;
             opt.data.arg = msg->set_option.pb_frames;
@@ -2304,7 +2329,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_GOP_TYPE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_GOP_TYPE;
             ret = to_mve_gop_type(msg->set_option.gop_type,
@@ -2316,7 +2341,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_SVCT3_LEVEL1_PERIOD: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_SVCT3_LEVEL1_PEROID;
             opt.data.arg = msg->set_option.svct3_level1_period;
@@ -2326,7 +2351,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_INTER_MED_BUF_SIZE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_INTBUF_SIZE;
             opt.data.arg = msg->set_option.inter_med_buf_size;
@@ -2337,7 +2362,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_GOP_PFRAMES: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_GOP_RESET_DYNAMIC;
             param.data.reset_gop_dynamic.reset_gop_pframes = msg->set_option.reset_gop_pframes;
@@ -2346,7 +2371,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_LTR_PERIOD: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_GOP_RESET_LTR_PEROID_DYNAMIC;
             param.data.reset_ltr_peroid_dynamic.reset_ltr_peroid_pframes = msg->set_option.reset_ltr_period;
@@ -2355,7 +2380,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_INTRA_MB_REFRESH: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_INTRA_MB_REFRESH;
             opt.data.arg = msg->set_option.intra_mb_refresh;
@@ -2363,7 +2388,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CONSTR_IPRED: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CONSTR_IPRED;
             opt.data.arg = msg->set_option.constr_ipred ? 1 : 0;
@@ -2371,7 +2396,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_ENTROPY_SYNC: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_ENTROPY_SYNC;
             opt.data.arg = msg->set_option.entropy_sync ? 1 : 0;
@@ -2379,7 +2404,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_TEMPORAL_MVP: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_TEMPORAL_MVP;
             opt.data.arg = msg->set_option.temporal_mvp ? 1 : 0;
@@ -2387,7 +2412,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_TILES: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_TILES;
             opt.data.tiles.tile_rows = msg->set_option.tile.rows;
@@ -2396,7 +2421,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_MIN_LUMA_CB_SIZE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_MIN_LUMA_CB_SIZE;
             opt.data.arg = msg->set_option.min_luma_cb_size;
@@ -2404,7 +2429,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_RANGE: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type =
                 MVE_BUFFER_PARAM_TYPE_RATE_CONTROL_QP_RANGE;
@@ -2418,7 +2443,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_RANGE_I: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type =
                 MVE_BUFFER_PARAM_TYPE_RATE_CONTROL_QP_RANGE_I;
@@ -2432,7 +2457,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_ENTROPY_MODE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_H264_CABAC;
             ret = to_mve_h264_cabac(msg->set_option.entropy_mode,
@@ -2444,7 +2469,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_SLICE_SPACING_MB: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_SLICE_SPACING;
             opt.data.arg = msg->set_option.slice_spacing_mb;
@@ -2452,7 +2477,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_VP9_PROB_UPDATE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_VP9_PROB_UPDATE;
             ret = to_mve_vp9_prob_update(
@@ -2465,7 +2490,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_MV_SEARCH_RANGE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_MV_SEARCH_RANGE;
             opt.data.motion_vector_search_range.mv_search_range_x =
@@ -2478,7 +2503,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_BITDEPTH: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_STREAM_BITDEPTH;
             opt.data.bitdepth.luma_bitdepth =
@@ -2489,7 +2514,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CHROMA_FORMAT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_STREAM_CHROMA_FORMAT;
             opt.data.arg = msg->set_option.chroma_format;
@@ -2497,7 +2522,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RGB_TO_YUV_MODE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             int i = 0;
             opt.index = MVE_SET_OPT_INDEX_ENC_RGB_TO_YUV_MODE;
             opt.data.rgb2yuv_params.rgb2yuv_mode = 0; // no use
@@ -2515,7 +2540,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_BAND_LIMIT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_BANDWIDTH_LIMIT;
             opt.data.arg = msg->set_option.band_limit;
@@ -2523,7 +2548,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_CABAC_INIT_IDC: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_CABAC_INIT_IDC;
             opt.data.arg = msg->set_option.cabac_init_idc;
@@ -2531,7 +2556,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_I: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_QP_I;
             param.data.qp.qp = msg->set_option.qp;
@@ -2540,7 +2565,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_P: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_QP_P;
             param.data.qp.qp = msg->set_option.qp;
@@ -2549,7 +2574,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_B: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_QP_B;
             param.data.qp.qp = msg->set_option.qp;
@@ -2558,7 +2583,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_FIXED_QP: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_FIXED_QP;
             opt.data.arg = msg->set_option.fixedqp;
@@ -2567,7 +2592,7 @@ static int put_message_v2(struct mvx_fw *fw,
 
         }
         case MVX_FW_SET_INIT_QP_I: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_INIT_QPI;
             opt.data.arg = msg->set_option.init_qpi;
@@ -2575,7 +2600,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_INIT_QP_P: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_INIT_QPP;
             opt.data.arg = msg->set_option.init_qpp;
@@ -2583,7 +2608,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_SAO_LUMA: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_SAO_LUMA_EN;
             opt.data.arg = msg->set_option.sao_luma;
@@ -2591,7 +2616,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_SAO_CHROMA: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_SAO_CHROMA_EN;
             opt.data.arg = msg->set_option.sao_chroma;
@@ -2599,7 +2624,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_DELTA_I_P: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_QP_DELTA_I_P;
             opt.data.arg = msg->set_option.qp_delta_i_p;
@@ -2607,7 +2632,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_REF_RB_EN: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_REF_RING_BUFFER;
             opt.data.arg = msg->set_option.ref_rb_en;
@@ -2615,7 +2640,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RC_CLIP_TOP: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_RC_CLIP_TOP;
             opt.data.arg = msg->set_option.rc_qp_clip_top;
@@ -2623,7 +2648,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RC_CLIP_BOT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_RC_CLIP_BOTTOM;
             opt.data.arg = msg->set_option.rc_qp_clip_bot;
@@ -2631,7 +2656,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_MAP_CLIP_TOP: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_QPMAP_CLIP_TOP;
             opt.data.arg = msg->set_option.qpmap_qp_clip_top;
@@ -2639,7 +2664,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_MAP_CLIP_BOT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_ENC_QPMAP_CLIP_BOTTOM;
             opt.data.arg = msg->set_option.qpmap_qp_clip_bot;
@@ -2647,7 +2672,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_ENC_LAMBDA_SCALE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_LAMBDA_SCALE;
             memcpy(&opt.data.lambda_scale, &msg->set_option.lambda_scale, sizeof(opt.data.lambda_scale));
@@ -2655,7 +2680,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_RESYNC_INTERVAL: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_RESYNC_INTERVAL;
             opt.data.arg = msg->set_option.resync_interval;
@@ -2663,7 +2688,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QUANT_TABLE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_QUANT_TABLE;
 
@@ -2685,7 +2710,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_HUFF_TABLE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_HUFFMAN_TABLE;
             if (msg->set_option.huff_table.type & MVX_OPT_HUFFMAN_TABLE_DC_LUMA) {
                 opt.data.huffman_table.type = MVE_OPT_HUFFMAN_TABLE_DC_LUMA;
@@ -2739,7 +2764,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_WATCHDOG_TIMEOUT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
 
             opt.index = MVE_SET_OPT_INDEX_WATCHDOG_TIMEOUT;
             opt.data.arg = msg->set_option.watchdog_timeout;
@@ -2748,7 +2773,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_ROI_REGIONS: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             int i = 0;
             param.type = MVE_BUFFER_PARAM_TYPE_REGIONS;
             param.data.regions.n_regions = msg->set_option.roi_config.num_roi;
@@ -2766,7 +2791,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_QP_REGION: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
 
             param.type = MVE_BUFFER_PARAM_TYPE_QP;
             param.data.qp.qp = msg->set_option.qp;
@@ -2776,7 +2801,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_EPR_QP: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             param.type = MVE_BUFFER_PARAM_TYPE_QP;
             param.data.qp.qp = msg->set_option.qp;
             param.data.qp.epr_iframe_enable = msg->set_option.epr_qp.epr_iframe_enable;
@@ -2786,7 +2811,7 @@ static int put_message_v2(struct mvx_fw *fw,
 
         }
         case MVX_FW_SET_CHR_CFG: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             param.type = MVE_BUFFER_PARAM_TYPE_CHANGE_RECTANGLES;
             param.data.change_rectangles.n_rectangles = msg->set_option.chr_cfg.num_chr;
             memcpy(param.data.change_rectangles.rectangles, msg->set_option.chr_cfg.rectangle, sizeof(msg->set_option.chr_cfg.rectangle));
@@ -2795,7 +2820,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_DSL_FRAME: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_DOWNSCALE;
             opt.data.downscaled_frame.width = msg->set_option.dsl_frame.width;
             opt.data.downscaled_frame.height = msg->set_option.dsl_frame.height;
@@ -2803,7 +2828,7 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_LONG_TERM_REF: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             if (msg->set_option.ltr.mode >= 1 && msg->set_option.ltr.mode <= 8) {
                 opt.index = MVE_SET_OPT_INDEX_ENC_LTR_MODE;
                 opt.data.arg = msg->set_option.ltr.mode;
@@ -2817,28 +2842,28 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_DSL_MODE: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_DOWNSCALE_POS_MODE;
             opt.data.dsl_pos.mode =  msg->set_option.dsl_pos_mode;
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.dsl_pos));
             break;
         }
         case MVX_FW_SET_DSL_INTERP_MODE:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_DSL_INTERP_MODE;
             opt.data.interp_mode.mode =  msg->set_option.dsl_interp_mode;
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.interp_mode));
             break;
         }
         case MVX_FW_SET_MINI_FRAME_CNT: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_MINI_FRAME_MAX;
             opt.data.arg =  msg->set_option.mini_frame_cnt;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_STATS_MODE: {
-            struct mve_buffer_param param;
+            struct mve_buffer_param param = {0};
             param.type = MVE_BUFFER_PARAM_TYPE_ENC_STATS;
             param.data.enc_stats.mms_buffer_size = msg->set_option.enc_stats.mms_buffer_size;
             param.data.enc_stats.bitcost_buffer_size = msg->set_option.enc_stats.bitcost_buffer_size;
@@ -2850,175 +2875,175 @@ static int put_message_v2(struct mvx_fw *fw,
             break;
         }
         case MVX_FW_SET_GDR_NUMBER: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_GDR_NUMBER;
             opt.data.arg =  msg->set_option.gdr_number;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_GDR_PERIOD: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_GDR_PERIOD;
             opt.data.arg =  msg->set_option.gdr_period;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_MULIT_SPS_PPS:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_MULTI_SPS_PPS;
             opt.data.arg =  msg->set_option.mulit_sps_pps;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_VISUAL_ENABLE:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_iNDEX_ENC_VISUAL_ENABLE;
             opt.data.arg =  msg->set_option.enable_visual;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_VISUAL_ENABLE_ADAPTIVE_INTRA_BLOCK:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_SCD_ADAPTIVE_I;
             opt.data.arg =  msg->set_option.adaptive_intra_block;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ADPTIVE_QUANTISATION:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_ADPTIVE_QUANTISATION;
             opt.data.arg =  msg->set_option.adapt_qnt;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_DISABLE_FEATURES:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DISABLE_FEATURES;
             opt.data.arg =  msg->set_option.disabled_features;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_SCD_ENABLE:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_SCD_ENABLE;
             opt.data.arg =  msg->set_option.scd_enable;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_SCD_PERCENT:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_SCD_PERCENT;
             opt.data.arg =  msg->set_option.scd_percent;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_SCD_THRESHOLD:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_SCD_THRESHOLD;
             opt.data.arg =  msg->set_option.scd_threshold;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_AQ_SSIM_EN:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_AQ_SSIM_EN;
             opt.data.arg =  msg->set_option.aq_ssim_en;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_AQ_NEG_RATIO:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_AQ_NEG_RATIO;
             opt.data.arg =  msg->set_option.aq_neg_ratio;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_AQ_POS_RATIO:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_AQ_POS_RATIO;
             opt.data.arg =  msg->set_option.aq_pos_ratio;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_AQ_QPDELTA_LMT:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_AQ_QPDELTA_LMT;
             opt.data.arg =  msg->set_option.aq_qpdelta_lmt;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_AQ_INIT_FRM_AVG_SVAR:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_AQ_INIT_FRM_AVG_SVAR;
             opt.data.arg =  msg->set_option.aq_init_frm_avg_svar;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_DEC_YUV2RGB_PARAMS:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_YUV2RGB_PARAMS;
             memcpy(&opt.data.yuv2rgb_params,&msg->set_option.yuv2rbg_csc_coef,sizeof(struct mvx_color_conv_coef));
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.yuv2rgb_params));
             break;
         }
         case MVX_FW_SET_ENC_FORCED_UV_VAL:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_FORCED_UV_VAL;
             opt.data.gray_uv_value.value =  msg->set_option.forced_uv_value;
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.gray_uv_value));
             break;
         }
         case MVX_FW_SET_ENC_SRC_CROPPING:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_SRC_CROPPING;
             memcpy(&opt.data.enc_src_crop,&msg->set_option.crop,sizeof(struct mvx_crop_cfg));
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.enc_src_crop));
             break;
         }
         case MVX_FW_SET_DEC_DST_CROPPING:{
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_DEC_DST_CROPPING;
             memcpy(&opt.data.dec_dst_crop,&msg->set_option.crop,sizeof(struct mvx_crop_cfg));
             ret = put_fw_opt(fw, &opt, sizeof(opt.index) + sizeof(opt.data.dec_dst_crop));
             break;
         }
         case MVX_FW_SET_ENC_INTRA_IPENALTY_ANGULAR: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_IPENALTY_ANGULAR;
             opt.data.arg =  msg->set_option.intra_ipenalty_angular;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ENC_INTRA_IPENALTY_PLANAR: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_IPENALTY_PLANAR;
             opt.data.arg =  msg->set_option.intra_ipenalty_planar;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ENC_INTRA_IPENALTY_DC: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_IPENALTY_DC;
             opt.data.arg =  msg->set_option.intra_ipenalty_dc;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ENC_INTER_IPENALTY_ANGULAR: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_INTER_IPENALTY_ANGULAR;
             opt.data.arg =  msg->set_option.inter_ipenalty_angular;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ENC_INTER_IPENALTY_PLANAR: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_INTER_IPENALTY_PLANAR;
             opt.data.arg =  msg->set_option.inter_ipenalty_planar;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
             break;
         }
         case MVX_FW_SET_ENC_INTER_IPENALTY_DC: {
-            struct mve_request_set_option opt;
+            struct mve_request_set_option opt = {0};
             opt.index = MVE_SET_OPT_INDEX_ENC_INTER_IPENALTY_DC;
             opt.data.arg =  msg->set_option.inter_ipenalty_dc;
             ret = put_fw_opt(fw, &opt, sizeof(opt.data.arg));
@@ -3055,9 +3080,9 @@ static int put_message_v2(struct mvx_fw *fw,
         break;
     }
     case MVX_FW_CODE_BUFFER: {
-        struct mve_comm_area_host *host;
-        struct mve_comm_area_mve *mve;
-        enum mvx_log_fwif_channel channel;
+        struct mve_comm_area_host *host = NULL;
+        struct mve_comm_area_mve *mve = NULL;
+        enum mvx_log_fwif_channel channel = 0;
 
         if (msg->buf->dir == MVX_DIR_INPUT) {
             host = fw->buf_in_host;
@@ -3087,9 +3112,9 @@ static int put_message_v2(struct mvx_fw *fw,
         break;
     }
     case MVX_FW_CODE_EOS: {
-        struct mve_comm_area_host *host;
-        struct mve_comm_area_mve *mve;
-        enum mvx_log_fwif_channel channel;
+        struct mve_comm_area_host *host = NULL;
+        struct mve_comm_area_mve *mve = NULL;
+        enum mvx_log_fwif_channel channel = 0;
 
         /* The message is on the MVX_DIR_INPUT side. */
         host = fw->buf_in_host;
@@ -3245,6 +3270,7 @@ static void rpc_mem_alloc(struct mvx_fw *fw,
         if (IS_ERR(pages))
             goto unlock_mutex;
     }
+    pages->rpc_mem_region = p->mem_alloc.region;
 
     log2_alignment = p->mem_alloc.log2_alignment <= MVE_PAGE_SHIFT ? MVE_PAGE_SHIFT : p->mem_alloc.log2_alignment;
     alignment_bytes = 1 << log2_alignment;
@@ -3344,7 +3370,7 @@ static void rpc_mem_resize(struct mvx_fw *fw,
                 /* Allocate a new secure DMA buffer. */
                 dmabuf = mvx_secure_mem_alloc(
                     fw->fw_bin->secure.secure, size,
-                    p->mem_alloc.region);
+                    pages->rpc_mem_region);
                 if (IS_ERR(dmabuf))
                     goto unlock_mutex;
 
@@ -3378,8 +3404,8 @@ static void rpc_mem_resize(struct mvx_fw *fw,
     fw->client_ops->flush_mmu(fw->csession);
 
     MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_INFO,
-              "RPC resize memory. va=0x%x, new_size=%u.",
-              p->mem_resize.ve_pointer, p->mem_resize.new_size);
+              "RPC resize memory. region=%u, va=0x%x, new_size=%u.",
+              pages->rpc_mem_region, p->mem_resize.ve_pointer, p->mem_resize.new_size);
 
 unlock_mutex:
     if (IS_ENABLED(CONFIG_DEBUG_FS))
@@ -3608,7 +3634,7 @@ static int map_msq(struct mvx_fw *fw,
         return ret;
 
     /* Allocate page and store Linux logical address in 'data'. */
-    page = mvx_mmu_alloc_page(fw->dev, GFP_KERNEL | __GFP_ZERO);
+    page = mvx_mmu_alloc_page(fw->dev, GFP_KERNEL | __GFP_ZERO | __GFP_RETRY_MAYFAIL);
     if (page == 0)
         return -ENOMEM;
 
@@ -3661,9 +3687,14 @@ static int map_fw_print_ram(struct mvx_fw *fw,
 
     /* Allocate pages and store Linux logical address in 'data'. */
     vmap = mvx_mmu_alloc_noncontiguous(fw->dev, &fw->print_ram_pages, &fw->print_ram_sgt,
-                   MVE_FW_PRINT_RAM_SIZE, GFP_KERNEL | __GFP_ZERO);
-    if (vmap == NULL)
+                   MVE_FW_PRINT_RAM_SIZE, GFP_KERNEL | __GFP_ZERO | __GFP_RETRY_MAYFAIL);
+    if (vmap == NULL) {
+        MVX_LOG_PRINT_SESSION(
+                &mvx_log_session_if, MVX_LOG_WARNING,
+                fw->session,
+                "Allocate memory of fw print ram fail.");
         return -ENOMEM;
+    }
 
     ret = mvx_mmu_map_pages(fw->mmu, begin, fw->print_ram_pages,
                     MVX_ATTR_SHARED_RW, MVX_ACCESS_READ_WRITE, NULL);

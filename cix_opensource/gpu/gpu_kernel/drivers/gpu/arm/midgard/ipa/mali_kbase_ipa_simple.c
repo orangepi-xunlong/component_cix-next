@@ -92,6 +92,7 @@ KBASE_EXPORT_TEST_API(kbase_simple_power_model_set_dummy_temp);
  * @poll_temperature_thread: Handle for temperature polling thread
  * @current_temperature: Most recent value of polled temperature
  * @temperature_poll_interval_ms: How often temperature should be checked, in ms
+ * @switch_on_temp: Switch-on temperature of the thermal zone, in mC
  */
 
 struct kbase_ipa_model_simple_data {
@@ -103,6 +104,7 @@ struct kbase_ipa_model_simple_data {
 	struct task_struct *poll_temperature_thread;
 	int current_temperature;
 	int temperature_poll_interval_ms;
+	int switch_on_temp;
 };
 #define FALLBACK_STATIC_TEMPERATURE 55000
 
@@ -150,6 +152,7 @@ static int poll_temperature(void *data)
 {
 	struct kbase_ipa_model_simple_data *model_data = (struct kbase_ipa_model_simple_data *)data;
 	int temp;
+	int new_interval = model_data->temperature_poll_interval_ms;
 
 	while (!kthread_should_stop()) {
 		struct thermal_zone_device *tz = READ_ONCE(model_data->gpu_tz);
@@ -163,7 +166,14 @@ static int poll_temperature(void *data)
 					"Error reading temperature for gpu thermal zone: %d\n",
 					ret);
 				temp = FALLBACK_STATIC_TEMPERATURE;
+			} else {
+				if (temp < model_data->switch_on_temp)
+					new_interval = 1000;
+				else
+					new_interval = 200;
 			}
+			if (model_data->temperature_poll_interval_ms != new_interval)
+				model_data->temperature_poll_interval_ms = new_interval;
 		} else {
 			temp = FALLBACK_STATIC_TEMPERATURE;
 		}
@@ -342,6 +352,20 @@ static int kbase_simple_power_model_recalculate(struct kbase_ipa_model *model)
 		 */
 		if (strncmp(tz_name, model_data->tz_name, sizeof(tz_name)) == 0)
 			model_data->gpu_tz = tz;
+
+		struct thermal_trip trip;
+		/* Get trip index based on ACPI companion */
+		int trip_index = has_acpi_companion(model->kbdev->dev) ? 1 : 0;
+
+		if (thermal_zone_get_trip(tz, trip_index, &trip) == 0 && 
+			trip.type == THERMAL_TRIP_PASSIVE) {
+			model_data->switch_on_temp = trip.temperature;
+		} else {
+			model_data->switch_on_temp = 70000;
+			dev_warn(model->kbdev->dev, 
+				"Failed to find passive trip point (index %d), falling back to default %d mC", 
+				trip_index, model_data->switch_on_temp);
+		}
 	}
 
 	return 0;

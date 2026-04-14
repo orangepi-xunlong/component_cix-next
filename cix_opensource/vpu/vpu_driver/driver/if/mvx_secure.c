@@ -74,6 +74,13 @@ struct mvx_secure_mem {
     struct dma_buf *dmabuf;
 };
 
+struct mvx_secure_hardware_priv {
+    struct device *dev;
+    struct kobject kobj;
+    wait_queue_head_t wait_queue;
+    int32_t done;
+};
+
 /****************************************************************************
  * Secure
  ****************************************************************************/
@@ -409,4 +416,99 @@ put_kobject:
     kobject_put(&smem->kobj);
 
     return dmabuf;
+}
+
+/****************************************************************************
+ * Protected session initialize
+ ****************************************************************************/
+
+static void secure_hw_release(struct kobject *kobj)
+{
+    struct mvx_secure_hardware_priv *secure_hw =
+        container_of(kobj, struct mvx_secure_hardware_priv, kobj);
+
+    devm_kfree(secure_hw->dev, secure_hw);
+}
+
+/**
+ * hardware_store() - Protected session initializing Acknowledge.
+ *
+ * Store values from memory descriptor, get the result of initialization and
+ * wake up any waiting process. The result should be 1 on success, else negative
+ * value of error code.
+ */
+static ssize_t hardware_store(struct kobject *kobj,
+                struct kobj_attribute *attr,
+                const char *buf,
+                size_t size)
+{
+    struct mvx_secure_hardware_priv *secure_hw =
+        container_of(kobj, struct mvx_secure_hardware_priv, kobj);
+    const int32_t *done = (const int32_t *)buf;
+
+    secure_hw->done = *done;
+    if (secure_hw->done <= 0)
+        MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
+                    "Failed to initialize hardware, ret=%d",
+                    secure_hw->done);
+
+    wake_up_interruptible(&secure_hw->wait_queue);
+
+    return size;
+}
+
+int mvx_secure_init_vpu(struct mvx_secure *secure)
+{
+    static struct kobj_attribute attr = __ATTR_WO(hardware);
+    static struct attribute *mvx_secure_hw_attrs[] = {
+        &attr.attr,
+        NULL
+    };
+    ATTRIBUTE_GROUPS(mvx_secure_hw);
+
+    static struct kobj_type secure_hw_ktype = {
+        .sysfs_ops     = &kobj_sysfs_ops,
+        .release       = secure_hw_release,
+        .default_groups = mvx_secure_hw_groups
+    };
+    struct mvx_secure_hardware_priv *securehw;
+    char *env[] = { "TYPE=hardware", NULL, NULL, NULL };
+    int ret;
+
+    securehw = devm_kzalloc(secure->dev, sizeof(*securehw), GFP_KERNEL);
+    if (securehw == NULL)
+        return -ENOMEM;
+
+    securehw->dev = secure->dev;
+    securehw->kobj.kset = secure->kset;
+    init_waitqueue_head(&securehw->wait_queue);
+
+    ret = kobject_init_and_add(&securehw->kobj, &secure_hw_ktype, NULL, "%px",
+                   &securehw->kobj);
+    if (ret != 0)
+        goto put_kobject;
+
+    ret = kobject_uevent_env(&securehw->kobj, KOBJ_ADD, env);
+    if (ret != 0) {
+        MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
+                  "Failed to send secure hardware uevent. ret=%d.",
+                  ret);
+        goto put_kobject;
+    }
+    ret = wait_event_interruptible_timeout(securehw->wait_queue,
+                           securehw->done > 0,
+                           msecs_to_jiffies(1000));
+    if (ret == 0) {
+        MVX_LOG_PRINT(&mvx_log_if, MVX_LOG_WARNING,
+                  "Secure initialize hardware timed out.");
+        ret = -EBUSY;
+        goto put_kobject;
+    }
+
+    ret = 0;
+
+put_kobject:
+    kobject_put(&securehw->kobj);
+
+    return ret;
 }

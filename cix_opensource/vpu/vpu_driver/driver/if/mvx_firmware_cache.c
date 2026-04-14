@@ -521,15 +521,17 @@ static struct mvx_fw_bin *fw_bin_get(struct mvx_fw_cache *cache,
     if (ret != 0)
         return ERR_PTR(ret);
 
-    /* Search if firmware binary has already been loaded. */
-    list_for_each_entry(tmp, &cache->fw_bin_list, cache_head) {
-        if (tmp->format == format && tmp->dir == dir &&
-            hwvercmp(&tmp->hw_ver, hw_ver) == 0 &&
-            tmp->securevideo == securevideo &&
-            atomic_read(&tmp->flush_cnt) ==
-            atomic_read(&cache->flush_cnt)) {
-            fw_bin = tmp;
-            break;
+    if (!securevideo) {
+        /* Search if firmware binary has already been loaded. */
+        list_for_each_entry(tmp, &cache->fw_bin_list, cache_head) {
+            if (tmp->format == format && tmp->dir == dir &&
+                hwvercmp(&tmp->hw_ver, hw_ver) == 0 &&
+                tmp->securevideo == securevideo &&
+                atomic_read(&tmp->flush_cnt) ==
+                atomic_read(&cache->flush_cnt)) {
+                fw_bin = tmp;
+                break;
+            }
         }
     }
 
@@ -731,6 +733,9 @@ void mvx_fw_cache_put(struct mvx_fw_cache *cache,
     int ret;
 
     ret = mutex_lock_interruptible(&cache->mutex);
+
+    if (fw_bin->securevideo && kref_read(&fw_bin->kobj.kref) == 2)
+        kobject_put(&fw_bin->kobj);
 
     kobject_put(&fw_bin->kobj);
 

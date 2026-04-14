@@ -11,7 +11,7 @@
  * permitted to do so under the terms of a subsisting license agreement
  * from Arm Technology (China) Co., Ltd.
  *
- * SPDX-License-Identifier: GPL-2.0-only
+ * SPDX-License-Identifier: (GPL-2.0-only WITH Linux-syscall-note)
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -480,6 +480,7 @@ enum v4l2_cid_mve_video {
     V4L2_CID_MVE_VIDEO_ENC_INTER_IPENALTY_ANGULAR,
     V4L2_CID_MVE_VIDEO_ENC_INTER_IPENALTY_PLANAR,
     V4L2_CID_MVE_VIDEO_ENC_INTER_IPENALTY_DC,
+    V4L2_CID_MVE_VIDEO_ENC_DISABLE_TIMESCALE,
 };
 
 #define V4L2_SESSION_PRIORITY_PREEMPTION 0

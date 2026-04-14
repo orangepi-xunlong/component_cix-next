@@ -502,9 +502,15 @@ static int sky1_npu_runtime_resume(struct device *dev)
 	return armchina_aipu_resume(p_dev);
 }
 
+static void npu_complete(struct device *dev) {
+	if (has_acpi_companion(dev))
+		pm_request_resume(dev);
+}
+
 static const struct dev_pm_ops cix_sky1_npu_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	SET_RUNTIME_PM_OPS(sky1_npu_runtime_suspend, sky1_npu_runtime_resume, NULL)
+	.complete = npu_complete,
 };
 #endif /* CONFIG_PM */
 
