@@ -352,25 +352,25 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 
     if (has_acpi_companion(&p_dev->dev)) {
 #ifdef	CONFIG_ACPI
-	p_dev->dev.power.ignore_children = true;
+		p_dev->dev.power.ignore_children = true;
         fwnode_for_each_child_node(p_dev->dev.fwnode, child) {
-		if (is_acpi_data_node(child)) {
-			continue;
-        	}
-        	if (!strncmp(acpi_device_bid(to_acpi_device_node(child)),
-                	 NPU_CORE_ACPI_NAME_PREFIX, ACPI_NAMESEG_SIZE - 1)) {
+            if (is_acpi_data_node(child)) {
+                continue;
+            }
+            if (!strncmp(acpi_device_bid(to_acpi_device_node(child)),
+                            NPU_CORE_ACPI_NAME_PREFIX, ACPI_NAMESEG_SIZE - 1)) {
 
-			if (i == CIX_NPU_PD_NUM)
-				break;
+				if (i == CIX_NPU_PD_NUM)
+					break;
 
-			cix_aipu_priv->pd_core[i] = bus_find_device_by_fwnode(&platform_bus_type, child);
-                	pm_runtime_enable(cix_aipu_priv->pd_core[i]);
-			dev_pm_domain_attach(cix_aipu_priv->pd_core[i], true);
-			dev_pm_set_driver_flags(cix_aipu_priv->pd_core[i], DPM_FLAG_NO_DIRECT_COMPLETE);
-			ACPI_COMPANION(cix_aipu_priv->pd_core[i])->power.flags.ignore_parent = true;
+				cix_aipu_priv->pd_core[i] = bus_find_device_by_fwnode(&platform_bus_type, child);
+                pm_runtime_enable(cix_aipu_priv->pd_core[i]);
+				dev_pm_domain_attach(cix_aipu_priv->pd_core[i], true);
+				dev_pm_set_driver_flags(cix_aipu_priv->pd_core[i], DPM_FLAG_NO_DIRECT_COMPLETE);
+				ACPI_COMPANION(cix_aipu_priv->pd_core[i])->power.flags.ignore_parent = true;
 
-                	i++;
-            	}
+                i++;
+            }
         }
 #endif
     } else {

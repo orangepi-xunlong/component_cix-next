@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2023-2024 Arm Technology (China) Co. Ltd. */
+/* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
 #include <linux/platform_device.h>
 #include <linux/of.h>
-#include <linux/acpi.h>
 #include "aipu_priv.h"
 #include "aipu_partition.h"
 #include "aipu_common.h"
@@ -28,6 +27,7 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 	partition->reg = &partition->priv->reg;
 	partition->irq_obj = partition->priv->irq_obj;
 	mutex_init(&partition->reset_lock);
+	mutex_init(&partition->page_lock);
 	partition->ops = get_zhouyi_v3_ops();
 
 	/* unused fields */
@@ -104,9 +104,7 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	 * Both ids of clusters and partitions should be u32 numbered as 0, 1, 2, 3, ...
 	 * One cluster should only be within one partition.
 	 */
-
 	ret = device_property_count_u32(&p_dev->dev, "cluster-partition");
-
 	if (ret <= 0) {
 		dev_warn(&p_dev->dev, "use the default config (1 cluster)");
 		ret = 2;
@@ -116,9 +114,10 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	WARN_ON(!cluster_cnt);
 
 	cluster_arr = devm_kzalloc(&p_dev->dev, cluster_cnt * 2 * sizeof(u32), GFP_KERNEL);
+
 	if (device_property_read_u32_array(&p_dev->dev, "cluster-partition", cluster_arr,
-				       cluster_cnt * 2)) {
-		dev_err(&p_dev->dev, "check your dts: read cluster-partition failed");
+			cluster_cnt * 2)) {
+		dev_err(&p_dev->dev, "check your dts or acpi table: read cluster-partition failed");
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -127,7 +126,7 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 			partition_cnt = cluster_arr[2 * iter + 1] + 1;
 	}
 
-	partitions = devm_kzalloc(&p_dev->dev, sizeof(*partitions), GFP_KERNEL);
+	partitions = devm_kzalloc(&p_dev->dev, sizeof(*partitions) * partition_cnt, GFP_KERNEL);
 	if (!partitions)
 		return ERR_PTR(-ENOMEM);
 
@@ -217,10 +216,35 @@ static int v3_global_soft_reset(struct aipu_priv *aipu)
 	return zhouyi_soft_reset(&aipu->reg, TSM_SOFT_RESET_REG, aipu->reset_delay_us);
 }
 
+static int zhouyi_v3_read_cluster_status(struct aipu_priv *aipu, struct aipu_cluster_status *status)
+{
+	int i = 1;
+
+	if (unlikely(!status))
+		return -EINVAL;
+
+	if (unlikely(!aipu))
+		return -EINVAL;
+
+	mutex_lock(&aipu->partitions[0].page_lock);
+	aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, SELECT_DEBUG_CORE(0, 0));
+	status->cluster_status = aipu_read32(&aipu->reg, DEBUG_CLUSTER_STATUS);
+	status->core_status = (aipu_read32(&aipu->reg, DEBUG_CORE_STATUS) >> 4) & 0b1;
+	for (; i < aipu->partitions[0].clusters[0].core_cnt; ++i) {
+		aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, SELECT_DEBUG_CORE(0, i));
+		status->core_status |= (((aipu_read32(&aipu->reg, DEBUG_CORE_STATUS) >> 4)
+								& 0b1) << i);
+	}
+	aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, DISABLE_DEBUG);
+	mutex_unlock(&aipu->partitions[0].page_lock);
+	return 0;
+}
+
 static struct aipu_priv_operations v3_priv_ops = {
 	.create_partitions = v3_create_partitions,
 	.destroy_partitions = v3_destroy_partitions,
 	.global_soft_reset = v3_global_soft_reset,
+	.get_partition_status = zhouyi_v3_read_cluster_status,
 };
 
 struct aipu_priv_operations *get_v3_priv_ops(void)

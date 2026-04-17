@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2023-2024 Arm Technology (China) Co. Ltd. */
+/* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
 /**
  * SoC: Allwinner R329 platform
@@ -99,6 +99,8 @@ static struct aipu_soc_operations r329_ops = {
 	.disable_clk = r329_disable_clk,
 	.is_clk_enabled = NULL,
 	.is_aipu_irq = NULL,
+	.soc_pm_runtime_get_sync = NULL,
+	.soc_pm_runtime_put = NULL,
 };
 
 static int r329_probe(struct platform_device *p_dev)
